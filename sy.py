@@ -25,12 +25,11 @@ TOKEN = os.environ.get("TOKEN")
 OWNER_ID_STR = os.environ.get("OWNER_ID") 
 # رابط Render العام للخدمة (مطلوب للـ Webhooks)
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL") 
-# يتم توفير PORT تلقائياً بواسطة Render، ويفترض أن يكون 8080 افتراضياً
-PORT = int(os.environ.get('PORT', '8080')) 
+# يتم توفير PORT تلقائياً بواسطة Render
+PORT = int(os.environ.get('PORT', '10000')) 
 
 try:
     if not TOKEN or not OWNER_ID_STR or not WEBHOOK_URL:
-        # يمكنك تغيير رسالة الخطأ هذه لرسالة أكثر دقة
         print("❌ خطأ: يجب تحديد متغيرات البيئة TOKEN و OWNER_ID و WEBHOOK_URL.") 
         sys.exit(1)
         
@@ -39,7 +38,7 @@ except ValueError:
     print("❌ خطأ: OWNER_ID يجب أن يكون رقماً صحيحاً في متغيرات البيئة.")
     sys.exit(1)
     
-# اسم ملف قاعدة البيانات (يمكن تركه كقيمة افتراضية)
+# اسم ملف قاعدة البيانات
 DB_NAME = os.environ.get("DB_NAME", "subscribers.db")
 
 # --- كود الدفع لخدمة الشام كاش ---
@@ -383,7 +382,7 @@ async def send_static_content(application: Application, content_list: list, cont
     logging.info(f"تم إرسال {content_type} لـ {len(users)} مشتركين.")
 
 
-# 🚨 تم تعديل هذه الدالة لسحب الـ scheduler من application.bot_data
+# 🚨 الدالة المجدولة: تسحب الـ scheduler من application.bot_data
 async def schedule_daily_prayer_notifications(application: Application): 
     # سحب الـ scheduler من bot_data
     scheduler = application.bot_data.get('scheduler') 
@@ -459,15 +458,16 @@ async def schedule_daily_prayer_notifications(application: Application):
             logging.error(f"خطأ أثناء جدولة الصلوات للمستخدم {user_id}: {e}")
 
 
-# ==================== دالة Callback لبدء الجدولة ====================
-
-# 🚨 تم تعديل هذه الدالة لسحب الـ scheduler من application.bot_data
+# 🚨 دالة Callback لبدء الجدولة (تستخدم bot_data)
 async def post_init_callback(application: Application):
     # سحب الـ scheduler من bot_data
     scheduler = application.bot_data.get('scheduler') 
-    if scheduler and not hasattr(application, 'scheduler_started'):
+    
+    # التحقق من وجود scheduler وعدم بدء تشغيله بعد (باستخدام bot_data)
+    if scheduler and not application.bot_data.get('scheduler_started', False):
         scheduler.start()
-        application.scheduler_started = True
+        # تخزين حالة البدء في bot_data
+        application.bot_data['scheduler_started'] = True 
         logging.info("تم بنجاح بدء تشغيل مُجدول المهام (APScheduler).")
 
 # ==================== دالة التشغيل الرئيسية المُعدلة للـ Webhooks ====================
@@ -480,7 +480,7 @@ def main():
     scheduler.add_job(check_expiry_and_update, 'cron', hour=0, minute=5) 
     scheduler.add_job(
         schedule_daily_prayer_notifications, 'cron', hour=1, minute=0, 
-        args=[None] # تم حذف الـ scheduler من الـ args
+        args=[None] 
     )
     scheduler.add_job(
         send_static_content, 'cron', hour=6, minute=30, 
