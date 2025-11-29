@@ -30,7 +30,8 @@ PORT = int(os.environ.get('PORT', '8080'))
 
 try:
     if not TOKEN or not OWNER_ID_STR or not WEBHOOK_URL:
-        print("❌ خطأ: يجب تحديد متغيرات البيئة TOKEN و OWNER_ID و WEBHOOK_URL.")
+        # يمكنك تغيير رسالة الخطأ هذه لرسالة أكثر دقة
+        print("❌ خطأ: يجب تحديد متغيرات البيئة TOKEN و OWNER_ID و WEBHOOK_URL.") 
         sys.exit(1)
         
     OWNER_ID = int(OWNER_ID_STR)
@@ -381,7 +382,15 @@ async def send_static_content(application: Application, content_list: list, cont
             
     logging.info(f"تم إرسال {content_type} لـ {len(users)} مشتركين.")
 
-async def schedule_daily_prayer_notifications(application: Application, scheduler: AsyncIOScheduler):
+
+# 🚨 تم تعديل هذه الدالة لسحب الـ scheduler من application.bot_data
+async def schedule_daily_prayer_notifications(application: Application): 
+    # سحب الـ scheduler من bot_data
+    scheduler = application.bot_data.get('scheduler') 
+    if not scheduler:
+        logging.error("❌ Scheduler object not found in bot_data. Cannot schedule jobs.")
+        return
+        
     current_date = datetime.datetime.now().date()
     logging.info(f"بدء مهمة الجدولة اليومية لمواقيت الصلاة وأذكار المساء بتاريخ {current_date}.")
 
@@ -452,9 +461,12 @@ async def schedule_daily_prayer_notifications(application: Application, schedule
 
 # ==================== دالة Callback لبدء الجدولة ====================
 
+# 🚨 تم تعديل هذه الدالة لسحب الـ scheduler من application.bot_data
 async def post_init_callback(application: Application):
-    if not hasattr(application, 'scheduler_started'):
-        application.scheduler.start()
+    # سحب الـ scheduler من bot_data
+    scheduler = application.bot_data.get('scheduler') 
+    if scheduler and not hasattr(application, 'scheduler_started'):
+        scheduler.start()
         application.scheduler_started = True
         logging.info("تم بنجاح بدء تشغيل مُجدول المهام (APScheduler).")
 
@@ -464,10 +476,11 @@ def main():
     setup_db() 
     scheduler = AsyncIOScheduler(timezone='Asia/Damascus')
     
+    # إضافة المهام الابتدائية إلى الـ scheduler
     scheduler.add_job(check_expiry_and_update, 'cron', hour=0, minute=5) 
     scheduler.add_job(
         schedule_daily_prayer_notifications, 'cron', hour=1, minute=0, 
-        args=[None, scheduler] 
+        args=[None] # تم حذف الـ scheduler من الـ args
     )
     scheduler.add_job(
         send_static_content, 'cron', hour=6, minute=30, 
@@ -475,8 +488,11 @@ def main():
     )
     
     application = Application.builder().token(TOKEN).post_init(post_init_callback).build() 
-    application.scheduler = scheduler 
     
+    # 🚨 FIX: تخزين الـ scheduler في application.bot_data
+    application.bot_data['scheduler'] = scheduler 
+    
+    # FIX: تعديل وسائط الـ jobs لتمرير كائن الـ application
     for job in scheduler.get_jobs():
         if job.args and job.args[0] is None:
              job.modify(args=[application] + list(job.args[1:]))
