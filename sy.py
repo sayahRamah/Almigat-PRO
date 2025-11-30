@@ -227,9 +227,6 @@ async def subscribe_callback_handler(update: Update, context: ContextTypes.DEFAU
         f"لاستكمال الدفع، يرجى مسح رمز QR الذي سيتم إرساله أدناه أو نسخ الكود:\n"
         f"<b>كود الدفع:</b>\n"
         f"<code>{PAYMENT_QR_CODE_CONTENT}</code>\n\n"
-        f"<b>2. إرسال الإيصال:</b>\n"
-        f"أرسل صورة <b>إيصال الدفع</b> إلى المالك (@AlmiqatPRO_bot) ليقوم بالتأكيد والتفعيل فوراً.\n" 
-        f"<b>⚠️ هام:</b> لا تحتاج لإرسال رقم الطلب يدوياً للمالك، فقط أرسل صورة الإيصال بعد الدفع."
     )
 
     await query.edit_message_text(final_message, parse_mode='HTML')
