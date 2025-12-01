@@ -44,7 +44,7 @@ AZKAR_MASAA_LIST = [
     "🌙 يامقلب القلوب ثبت قلبي على دينك. (مثال لأذكار المساء)",
 ]
 
-# بيانات المدن السورية مع الـ URL الخاص بمواقيت الصلاة
+# 🆕 قائمة المدن الموسعة
 SYRIAN_CITIES = {
     "دمشق": PRAYER_API_URL.format("Damascus"),
     "حلب": PRAYER_API_URL.format("Aleppo"),
@@ -52,6 +52,10 @@ SYRIAN_CITIES = {
     "حماة": PRAYER_API_URL.format("Hama"),
     "اللاذقية": PRAYER_API_URL.format("Latakia"),
     "طرطوس": PRAYER_API_URL.format("Tartus"),
+    "درعا": PRAYER_API_URL.format("Daraa"), 
+    "الرقة": PRAYER_API_URL.format("Raqqa"),
+    "دير الزور": PRAYER_API_URL.format("Deir ez-Zor"),
+    "إدلب": PRAYER_API_URL.format("Idlib"), 
 }
 
 logging.basicConfig(
@@ -137,14 +141,13 @@ def get_city_ar_from_url(url):
             return name_ar
     return "المدينة" # Fallback
 
-# 🆕 دالة جديدة لفحص حالة API
 async def check_prayer_api_status():
     """يفحص اتصال API الأذان عبر محاولة جلب مواقيت دمشق."""
-    test_url = SYRIAN_CITIES.get("دمشق") # استخدام دمشق كمدينة اختبار
+    test_url = SYRIAN_CITIES.get("دمشق") 
     
     try:
         response = requests.get(test_url, timeout=10)
-        response.raise_for_status() # إثارة HTTPError لأكواد 4xx/5xx
+        response.raise_for_status() 
         
         data = response.json()
         if data and data.get('data') and data.get('data').get('timings'):
@@ -340,8 +343,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for name in SYRIAN_CITIES.keys()
     ]
     
-    keyboard.append(city_buttons[:3])
-    keyboard.append(city_buttons[3:])
+    # 🆕 منطق تقسيم الأزرار الجديد لضمان عرض جميع المدن (3 أزرار في كل صف)
+    row_size = 3 
+    for i in range(0, len(city_buttons), row_size):
+        keyboard.append(city_buttons[i:i + row_size])
     
     subscribe_button_text = "💰 إدارة/تجديد الاشتراك (1$ أسبوعياً)"
     keyboard.append([InlineKeyboardButton(subscribe_button_text, callback_data="manage_subscription")])
@@ -368,7 +373,6 @@ async def show_subscribers_command(update: Update, context: ContextTypes.DEFAULT
         logging.error(f"فشل إرسال إحصائيات المشتركين: {e}")
         await update.message.reply_text("❌ عذراً، حدث خطأ أثناء جلب الإحصائيات.")
 
-# 🆕 أمر جديد: فحص حالة الجدولة والـ API
 async def check_jobs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != OWNER_ID:
         await update.message.reply_text("❌ هذا الأمر مخصص للمالك فقط.")
@@ -468,8 +472,9 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 photo=QR_FILE_ID,
                 caption="رمز QR الخاص بالدفع (شام كاش). يرجى إرسال رقم العملية بعد التحويل."
             )
-        except Exception:
-             await query.message.reply_text("عذراً، فشل إرسال صورة QR. تأكد من صحة QR_FILE_ID.")
+        except Exception as e:
+             # 🆕 تحسين رسالة الخطأ للمالك
+             await query.message.reply_text(f"❌ عذراً، فشل إرسال صورة QR. تأكد من أن قيمة QR_FILE_ID صحيحة ومتاحة للبوت في متغيرات Render. الخطأ: {e}")
 
     elif data == "activate_sub":
         end_date = update_subscription(user_id)
@@ -514,9 +519,11 @@ async def post_init_callback(application: Application):
         scheduler = AsyncIOScheduler(timezone="Asia/Damascus")
         
         # 1. مهمة التحقق من انتهاء الاشتراكات
+        # 🚨 تم إضافة args=[application] لإصلاح فشل المُجدول
         scheduler.add_job(
             check_expiry_and_update, 
             trigger=CronTrigger(hour=0, minute=5, timezone="Asia/Damascus"),
+            args=[application], 
             id='check_expiry_and_update', 
             replace_existing=True
         )
@@ -563,7 +570,7 @@ def main():
     # إضافة المعالجات
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("stats", show_subscribers_command))
-    application.add_handler(CommandHandler("check_jobs", check_jobs_command)) # 🆕 الأمر الجديد
+    application.add_handler(CommandHandler("check_jobs", check_jobs_command))
     application.add_handler(CallbackQueryHandler(handle_callback))
 
     logging.info(f"البوت جاهز للعمل بنظام Webhooks على المنفذ {PORT}...")
