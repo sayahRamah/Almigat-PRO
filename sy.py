@@ -60,7 +60,7 @@ logging.basicConfig(
 )
 
 # --------------------------
-# 2. وظائف قاعدة البيانات
+# 2. وظائف قاعدة البيانات (Database Functions)
 # --------------------------
 
 def setup_db():
@@ -85,7 +85,6 @@ def get_user_status(user_id):
     result = cursor.fetchone()
     conn.close()
     if result:
-        # returns (is_premium, city_url)
         return result
     return (0, None)
 
@@ -106,6 +105,16 @@ def get_premium_users():
     result = cursor.fetchall()
     conn.close()
     return result
+
+def get_user_counts():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(user_id) FROM users")
+    total_users = cursor.fetchone()[0]
+    cursor.execute("SELECT COUNT(user_id) FROM users WHERE is_premium=1")
+    premium_users = cursor.fetchone()[0]
+    conn.close()
+    return total_users, premium_users
 
 def update_subscription(user_id, duration_days=7):
     end_date = datetime.datetime.now() + datetime.timedelta(days=duration_days)
@@ -128,8 +137,31 @@ def get_city_ar_from_url(url):
             return name_ar
     return "المدينة" # Fallback
 
+# 🆕 دالة جديدة لفحص حالة API
+async def check_prayer_api_status():
+    """يفحص اتصال API الأذان عبر محاولة جلب مواقيت دمشق."""
+    test_url = SYRIAN_CITIES.get("دمشق") # استخدام دمشق كمدينة اختبار
+    
+    try:
+        response = requests.get(test_url, timeout=10)
+        response.raise_for_status() # إثارة HTTPError لأكواد 4xx/5xx
+        
+        data = response.json()
+        if data and data.get('data') and data.get('data').get('timings'):
+            return True, "✅ API يعمل بشكل صحيح وتم استلام مواقيت الصلاة."
+        else:
+            return False, f"⚠️ API يعمل (كود {response.status_code}) لكن البيانات المستلمة غير صالحة."
+
+    except requests.exceptions.HTTPError as e:
+        return False, f"❌ فشل الاتصال بالـ API: حدث خطأ HTTP: {e}"
+    except requests.exceptions.RequestException as e:
+        return False, f"❌ فشل الاتصال بالـ API: خطأ في الشبكة/المهلة الزمنية: {e}"
+    except Exception as e:
+        return False, f"❌ خطأ غير متوقع أثناء فحص API: {e}"
+
+
 # --------------------------
-# 3. وظائف الإشعارات والجدولة
+# 3. وظائف الإشعارات والجدولة (Notification and Scheduling Functions)
 # --------------------------
 
 async def send_single_prayer_notification(application: Application, user_id: int, prayer_name: str, city_name: str):
@@ -153,7 +185,6 @@ async def send_static_content(application: Application, content_list: list, cont
 
     message = random.choice(content_list)
     
-    # يتم الإرسال للمستخدمين
     for user_id, _ in users:
         try:
             await application.bot.send_message(
@@ -162,11 +193,11 @@ async def send_static_content(application: Application, content_list: list, cont
                 parse_mode='HTML' 
             )
         except Exception:
-            pass # تجاهل الأخطاء إذا قام المستخدم بحظر البوت
+            pass
             
     logging.info(f"تم إرسال {content_type} لـ {len(users)} مشتركين.")
     
-    # 🔔 إشعار للمالك - تقرير الأذكار (تعديل جديد)
+    # 🔔 إشعار للمالك - تقرير الأذكار
     try:
         await application.bot.send_message(
             chat_id=OWNER_ID,
@@ -184,7 +215,6 @@ async def schedule_daily_prayer_notifications(application: Application):
         logging.error("❌ Scheduler object not found in bot_data. Cannot schedule jobs.")
         return
         
-    # 🆕 إعداد العدادات للتقرير
     scheduled_prayers_count = 0
     scheduled_azkar_masaa_count = 0
     total_users_for_report = 0
@@ -220,7 +250,6 @@ async def schedule_daily_prayer_notifications(application: Application):
                         hour, minute, 0
                     )
                     
-                    # الشرط الحاسم: لا نجدول إلا الصلوات التي لم يأت موعدها بعد
                     if run_datetime > datetime.datetime.now():
                         scheduler.add_job(
                             send_single_prayer_notification, 
@@ -232,9 +261,8 @@ async def schedule_daily_prayer_notifications(application: Application):
                         )
                         scheduled_prayers_count += 1
                     else:
-                        pass # تخطي الصلوات التي فات موعدها
+                        pass
                         
-
             # جدولة أذكار المساء
             isha_time_str = times_data.get('Isha')
             if isha_time_str and len(isha_time_str.split(':')) == 2:
@@ -261,7 +289,7 @@ async def schedule_daily_prayer_notifications(application: Application):
         except Exception as e:
             logging.error(f"خطأ أثناء جدولة الصلوات للمستخدم {user_id} أو فشل جلب API: {e}")
 
-    # 🔔 إشعار للمالك - تقرير الجدولة الذكي (تعديل جديد)
+    # 🔔 إشعار للمالك - تقرير الجدولة الذكي
     job_run_time = datetime.datetime.now().strftime("%H:%M:%S")
     report_message = f"📰 **تقرير جدولة الصلوات اليومي**\n"
     report_message += f"**عدد المشتركين المميزين:** {total_users_for_report}\n"
@@ -302,29 +330,88 @@ async def schedule_daily_prayer_notifications(application: Application):
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_status, _ = get_user_status(update.effective_user.id)
     
-    # رسالة الترحيب
     message = f"أهلاً بك يا {update.effective_user.first_name} في بوت الميقات الذهبي! 🕌\n"
     message += "للحصول على تنبيهات الصلاة والأذكار، يجب عليك الاشتراك أولاً.\n"
     
     keyboard = []
     
-    # أزرار اختيار المدينة
     city_buttons = [
         InlineKeyboardButton(name, callback_data=f"select_city_{name}")
         for name in SYRIAN_CITIES.keys()
     ]
     
-    # تقسيم الأزرار لصفين
     keyboard.append(city_buttons[:3])
     keyboard.append(city_buttons[3:])
     
-    # زر الاشتراك
     subscribe_button_text = "💰 إدارة/تجديد الاشتراك (1$ أسبوعياً)"
     keyboard.append([InlineKeyboardButton(subscribe_button_text, callback_data="manage_subscription")])
 
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     await update.message.reply_text(message, reply_markup=reply_markup)
+    
+async def show_subscribers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("❌ هذا الأمر مخصص للمالك فقط.")
+        return
+
+    try:
+        total_users, premium_users = get_user_counts()
+        
+        report = f"📊 **إحصائيات المشتركين**\n\n"
+        report += f"👤 **إجمالي المستخدمين المسجلين:** {total_users}\n"
+        report += f"⭐️ **المشتركين المميزين (Active Premium):** {premium_users}"
+        
+        await update.message.reply_text(report, parse_mode='Markdown')
+        
+    except Exception as e:
+        logging.error(f"فشل إرسال إحصائيات المشتركين: {e}")
+        await update.message.reply_text("❌ عذراً، حدث خطأ أثناء جلب الإحصائيات.")
+
+# 🆕 أمر جديد: فحص حالة الجدولة والـ API
+async def check_jobs_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != OWNER_ID:
+        await update.message.reply_text("❌ هذا الأمر مخصص للمالك فقط.")
+        return
+        
+    scheduler = context.application.bot_data.get('scheduler')
+    if not scheduler:
+        await update.message.reply_text("❌ لم يتم تشغيل مُجدول المهام بعد.")
+        return
+
+    # 1. فحص حالة API
+    api_status_ok, api_message = await check_prayer_api_status()
+    
+    report = f"🛠️ **تقرير فحص حالة البوت والجدولة**\n"
+    report += "--------------------------------------\n"
+    report += f"🌐 **حالة API مواقيت الصلاة:**\n{api_message}\n"
+    report += "--------------------------------------\n"
+    
+    # 2. فحص المهام المجدولة
+    jobs = scheduler.get_jobs()
+    
+    prayer_jobs_count = sum(1 for job in jobs if job.id.startswith('prayer_'))
+    azkar_masaa_jobs_count = sum(1 for job in jobs if job.id.startswith('azkar_masaa_'))
+    cron_jobs_count = sum(1 for job in jobs if isinstance(job.trigger, CronTrigger))
+
+    report += f"⏱️ **المهام المُجدوَلة حالياً:**\n"
+    report += f"  - صلوات مجدولة (فردية): **{prayer_jobs_count}**\n"
+    report += f"  - أذكار المساء مجدولة: **{azkar_masaa_jobs_count}**\n"
+    report += f"  - مهام CRON يومية (جدولة/انتهاء): **{cron_jobs_count}**\n"
+    report += f"  - إجمالي المهام في قائمة الانتظار: **{len(jobs)}**\n"
+    
+    # فحص موعد تشغيل CRON التالي
+    try:
+        daily_schedule_job = scheduler.get_job('schedule_daily_prayer_notifications')
+        if daily_schedule_job:
+            next_run = daily_schedule_job.next_run_time.strftime("%Y-%m-%d %H:%M:%S %Z")
+            report += f"\n🗓️ **موعد الجدولة اليومية القادم (01:00):**\n"
+            report += f"  - {next_run}"
+    except JobLookupError:
+         report += f"\n❌ فشل تحديد موقع وظيفة الجدولة اليومية."
+
+    await update.message.reply_text(report, parse_mode='Markdown')
+
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -337,7 +424,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         city_name = data.replace("select_city_", "")
         city_url = SYRIAN_CITIES.get(city_name)
         
-        # حفظ المدينة
         update_user_city(user_id, city_name, city_url)
         
         await query.edit_message_text(
@@ -349,18 +435,15 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "manage_subscription":
         user_status, city_url = get_user_status(user_id)
         
-        # التأكد من اختيار المدينة أولاً
         if not city_url:
             await query.edit_message_text(
                 text="⚠️ الرجاء اختيار مدينتك أولاً من القائمة الرئيسية لكي نعمل على جدولة مواقيت الصلاة لك.",
             )
             return
             
-        # إظهار شاشة الدفع
         message = "💳 **إدارة الاشتراك (الخدمة المتميزة)**\n"
         
         if user_status == 1:
-            # يجب عرض تاريخ الانتهاء الحقيقي من DB
             message += "حالتك الحالية: **مشترك مميز** ✅\n"
             message += "يمكنك تجديد اشتراكك الآن."
         else:
@@ -379,7 +462,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='Markdown')
 
     elif data == "show_qr":
-        # إرسال صورة QR
         try:
             await context.bot.send_photo(
                 chat_id=user_id,
@@ -390,7 +472,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
              await query.message.reply_text("عذراً، فشل إرسال صورة QR. تأكد من صحة QR_FILE_ID.")
 
     elif data == "activate_sub":
-        # مؤقت: تفعيل فوري للاختبار (يجب تعديله لآلية التحقق الحقيقية)
         end_date = update_subscription(user_id)
         await query.edit_message_text(
             f"🎉 **تم تفعيل اشتراكك المميز بنجاح!** 🎉\n"
@@ -400,7 +481,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # --------------------------
-# 5. وظائف إدارة المُجدول (Scheduler)
+# 5. وظائف إدارة المُجدول (Scheduler Functions)
 # --------------------------
 
 async def check_expiry_and_update(application: Application):
@@ -409,7 +490,6 @@ async def check_expiry_and_update(application: Application):
     cursor = conn.cursor()
     now_str = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     
-    # تحديث الاشتراكات المنتهية
     cursor.execute("""
         UPDATE users 
         SET is_premium=0, subscription_end_date=NULL
@@ -426,9 +506,6 @@ async def check_expiry_and_update(application: Application):
 async def post_init_callback(application: Application):
     """يتم استدعاؤها بعد تهيئة البوت وقبل بدء تشغيل الـ Webhook."""
     
-    # 🚨 معالجة المشكلة التي ظهرت على Render
-    # استخدام bot_data لتخزين كائن Scheduler وحالة تشغيله
-    
     if application.bot_data.get('scheduler_started'):
         logging.info("المُجدول تم تشغيله مسبقاً.")
         return
@@ -436,7 +513,7 @@ async def post_init_callback(application: Application):
     try:
         scheduler = AsyncIOScheduler(timezone="Asia/Damascus")
         
-        # 1. مهمة التحقق من انتهاء الاشتراكات (يومياً الساعة 00:05)
+        # 1. مهمة التحقق من انتهاء الاشتراكات
         scheduler.add_job(
             check_expiry_and_update, 
             trigger=CronTrigger(hour=0, minute=5, timezone="Asia/Damascus"),
@@ -444,8 +521,7 @@ async def post_init_callback(application: Application):
             replace_existing=True
         )
 
-        # 2. مهمة جدولة الصلوات اليومية (يومياً الساعة 01:00 صباحاً)
-        # تنطلق هذه المهمة لجدولة جميع صلوات وأذكار اليوم التالي
+        # 2. مهمة جدولة الصلوات اليومية
         scheduler.add_job(
             schedule_daily_prayer_notifications, 
             trigger=CronTrigger(hour=1, minute=0, timezone="Asia/Damascus"),
@@ -454,7 +530,7 @@ async def post_init_callback(application: Application):
             replace_existing=True
         )
         
-        # 3. مهمة إرسال أذكار الصباح (يومياً الساعة 06:30 صباحاً)
+        # 3. مهمة إرسال أذكار الصباح
         scheduler.add_job(
             send_static_content, 
             trigger=CronTrigger(hour=6, minute=30, timezone="Asia/Damascus"),
@@ -472,21 +548,22 @@ async def post_init_callback(application: Application):
         logging.error(f"❌ فشل بدء تشغيل المُجدول: {e}")
         
 # --------------------------
-# 6. دالة التشغيل الرئيسية
+# 6. دالة التشغيل الرئيسية (Main Function)
 # --------------------------
 
 def main():
     if not all([TOKEN, OWNER_ID, WEBHOOK_URL, QR_FILE_ID, PAYMENT_CODE]):
-        logging.error("❌ أحد متغيرات البيئة الأساسية (TOKEN, OWNER_ID, WEBHOOK_URL, إلخ) غير معرّف. يرجى مراجعة إعدادات Render.")
+        logging.error("❌ أحد متغيرات البيئة الأساسية غير معرّف. يرجى مراجعة إعدادات Render.")
         return
 
-    # إنشاء قاعدة البيانات
     setup_db()
     
     application = Application.builder().token(TOKEN).post_init(post_init_callback).build()
 
     # إضافة المعالجات
     application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("stats", show_subscribers_command))
+    application.add_handler(CommandHandler("check_jobs", check_jobs_command)) # 🆕 الأمر الجديد
     application.add_handler(CallbackQueryHandler(handle_callback))
 
     logging.info(f"البوت جاهز للعمل بنظام Webhooks على المنفذ {PORT}...")
