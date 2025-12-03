@@ -2,5 +2,5 @@
 python-telegram-bot==20.7
 apscheduler==3.10.4
 requests==2.31.0
-asyncpg==0.29.0
+pg8000==1.30.4
 python-dotenv==1.0.0
