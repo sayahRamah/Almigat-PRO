@@ -7,7 +7,7 @@ import time
 import sys
 import sqlite3
 from urllib.parse import urlparse
-from enum import Enum
+from collections import defaultdict
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
@@ -42,7 +42,7 @@ SYRIAN_CITIES = {
 BASE_PRAYER_API = "https://api.aladhan.com/v1/timingsByCity?city={city_en}&country=Syria&method=4"
 BASE_WEATHER_API = "https://wttr.in/{city_en}_Syria?format=%C+%t+%w+%h"
 
-# ==================== قوائم الأذكار ====================
+# ==================== قوائم الأذكار المتنوعة ====================
 AZKAR_SABAH_LIST = [
     "📌 <b>أذكار الصباح:</b>\n\nاللهم بك أصبحنا، وبك أمسينا، وبك نحيا، وبك نموت، وإليك النشور. (مرة واحدة)",
     "📌 <b>أذكار الصباح:</b>\n\nأَصْبَحْنَا وَأَصْبَحَ الْمُلْكُ لِلَّهِ وَالْحَمْدُ لِلَّهِ، لَا إِلَهَ إِلَّا اللَّهُ وَحْدَهُ لَا شَرِيكَ لَهُ، لَهُ الْمُلْكُ وَلَهُ الْحَمْدُ وَهُوَ عَلَى كُلِّ شَيْءٍ قَدِيرٌ. (مرة واحدة)",
@@ -61,19 +61,33 @@ AZKAR_MASAA_LIST = [
     "📌 <b>أذكار المساء:</b>\n\nأعوذ بكلمات الله التامات من شر ما خلق. (ثلاث مرات)"
 ]
 
+AZKAR_AFTER_PRAYER = [
+    "📿 <b>أذكار بعد الصلاة:</b>\n\nأستغفر الله (3 مرات)\nاللهم أنت السلام ومنك السلام تباركت يا ذا الجلال والإكرام.",
+    "📿 <b>أذكار بعد الصلاة:</b>\n\nلا إله إلا الله وحده لا شريك له، له الملك وله الحمد وهو على كل شيء قدير (10 مرات)",
+    "📿 <b>أذكار بعد الصلاة:</b>\n\nسبحان الله (33 مرة)\nالحمد لله (33 مرة)\nالله أكبر (34 مرة)"
+]
+
+AZKAR_WEEKLY = [
+    "🌟 <b>ذكر الأسبوع:</b>\n\nلا حول ولا قوة إلا بالله العلي العظيم. تقال في الشدائد والمصائب.",
+    "🌟 <b>ذكر الأسبوع:</b>\n\nحسبي الله ونعم الوكيل. تقال عند اليأس من المخلوقين.",
+    "🌟 <b>ذكر الأسبوع:</b>\n\nرضيت بالله ربا، وبالإسلام دينا، وبمحمد صلى الله عليه وسلم نبيا."
+]
+
+DEFAULT_SUPPLICATIONS = [
+    "🤲 <b>دعاء اليوم:</b>\n\nاللهم إني أسألك علماً نافعاً، ورزقاً طيباً، وعملاً متقبلاً.",
+    "🤲 <b>دعاء اليوم:</b>\n\nاللهم اغفر لي ولوالدي وللمؤمنين والمؤمنات يوم يقوم الحساب.",
+    "🤲 <b>دعاء اليوم:</b>\n\nاللهم أصلح لي ديني الذي هو عصمة أمري، وأصلح لي دنياي التي فيها معاشي."
+]
+
 # ==================== دوال قاعدة البيانات (psycopg2) ====================
 def get_db_connection():
     """إنشاء اتصال بقاعدة البيانات"""
     try:
         if DATABASE_URL:
-            # استخدام PostgreSQL على Render
             import psycopg2
             result = urlparse(DATABASE_URL)
             
-            # تأكد من وجود المنفذ
-            port = result.port
-            if port is None:
-                port = 5432  # المنفذ الافتراضي لـ PostgreSQL
+            port = result.port or 5432
             
             conn = psycopg2.connect(
                 database=result.path[1:],
@@ -82,16 +96,14 @@ def get_db_connection():
                 host=result.hostname,
                 port=port
             )
-            logger.info("✅ تم الاتصال بـ PostgreSQL باستخدام psycopg2")
+            logger.info("✅ تم الاتصال بـ PostgreSQL")
             return conn
         else:
-            # استخدام SQLite للتطوير المحلي
             conn = sqlite3.connect("subscribers.db")
-            logger.info("✅ تم الاتصال بـ SQLite (تطوير محلي)")
+            logger.info("✅ تم الاتصال بـ SQLite")
             return conn
     except Exception as e:
         logger.error(f"❌ فشل الاتصال بقاعدة البيانات: {e}")
-        # محاولة الاتصال بـ SQLite كحل احتياطي
         try:
             conn = sqlite3.connect("subscribers.db")
             logger.info("⚠️ تم الاتصال بـ SQLite كحل احتياطي")
@@ -106,9 +118,7 @@ def setup_db():
         conn = get_db_connection()
         cursor = conn.cursor()
         
-        # جدول المستخدمين
         if DATABASE_URL:
-            # PostgreSQL
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id BIGINT PRIMARY KEY,
@@ -116,12 +126,10 @@ def setup_db():
                     end_date TEXT,
                     city_url TEXT DEFAULT NULL,
                     order_id TEXT DEFAULT NULL,
-                    contact_info TEXT DEFAULT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
         else:
-            # SQLite
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
@@ -129,7 +137,6 @@ def setup_db():
                     end_date TEXT,
                     city_url TEXT DEFAULT NULL,
                     order_id TEXT DEFAULT NULL,
-                    contact_info TEXT DEFAULT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -170,49 +177,6 @@ def save_user_city(user_id, city_url):
     except Exception as e:
         logger.error(f"❌ فشل في حفظ مدينة للمستخدم {user_id}: {e}")
         return False
-    finally:
-        if conn:
-            conn.close()
-
-def save_user_contact(user_id, contact_info):
-    """حفظ معلومات الاتصال للمستخدم"""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        if DATABASE_URL:
-            cursor.execute("UPDATE users SET contact_info = %s WHERE user_id = %s", (contact_info, user_id))
-        else:
-            cursor.execute("UPDATE users SET contact_info = ? WHERE user_id = ?", (contact_info, user_id))
-        
-        conn.commit()
-        logger.info(f"✅ تم حفظ معلومات الاتصال للمستخدم {user_id}")
-        return True
-    except Exception as e:
-        logger.error(f"❌ فشل في حفظ معلومات الاتصال للمستخدم {user_id}: {e}")
-        return False
-    finally:
-        if conn:
-            conn.close()
-
-def get_user_contact(user_id):
-    """الحصول على معلومات الاتصال للمستخدم"""
-    conn = None
-    try:
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        
-        if DATABASE_URL:
-            cursor.execute("SELECT contact_info FROM users WHERE user_id = %s", (user_id,))
-        else:
-            cursor.execute("SELECT contact_info FROM users WHERE user_id = ?", (user_id,))
-        
-        result = cursor.fetchone()
-        return result[0] if result and result[0] else None
-    except Exception as e:
-        logger.error(f"❌ فشل في جلب معلومات الاتصال للمستخدم {user_id}: {e}")
-        return None
     finally:
         if conn:
             conn.close()
@@ -282,6 +246,23 @@ def get_premium_users():
         if conn:
             conn.close()
 
+def get_all_users():
+    """الحصول على جميع المستخدمين"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, city_url, is_premium, created_at FROM users")
+        users = cursor.fetchall()
+        conn.close()
+        return users
+    except Exception as e:
+        logger.error(f"❌ فشل في جلب جميع المستخدمين: {e}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
 def get_user_counts():
     """الحصول على إحصائيات المستخدمين"""
     conn = None
@@ -300,6 +281,83 @@ def get_user_counts():
     finally:
         if conn:
             conn.close()
+
+def get_daily_stats():
+    """الحصول على إحصائيات اليوم"""
+    conn = None
+    try:
+        today = datetime.date.today().strftime("%Y-%m-%d")
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        if DATABASE_URL:
+            cursor.execute("""
+                SELECT COUNT(*) FROM users 
+                WHERE DATE(created_at) = %s
+            """, (today,))
+        else:
+            cursor.execute("""
+                SELECT COUNT(*) FROM users 
+                WHERE DATE(created_at) = ?
+            """, (today,))
+        
+        today_users = cursor.fetchone()[0] or 0
+        
+        if DATABASE_URL:
+            cursor.execute("""
+                SELECT COUNT(*) FROM users 
+                WHERE is_premium = 1 AND DATE(created_at) = %s
+            """, (today,))
+        else:
+            cursor.execute("""
+                SELECT COUNT(*) FROM users 
+                WHERE is_premium = 1 AND DATE(created_at) = ?
+            """, (today,))
+        
+        today_premium = cursor.fetchone()[0] or 0
+        
+        conn.close()
+        return today_users, today_premium
+    except Exception as e:
+        logger.error(f"❌ فشل في جلب إحصائيات اليوم: {e}")
+        return 0, 0
+    finally:
+        if conn:
+            conn.close()
+
+def get_city_distribution():
+    """توزيع المستخدمين حسب المحافظة"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT city_url, COUNT(*) FROM users GROUP BY city_url")
+        distribution = cursor.fetchall()
+        conn.close()
+        
+        city_stats = {}
+        for city_url, count in distribution:
+            if city_url:
+                city_ar = get_city_ar_from_url(city_url)
+                city_stats[city_ar] = count
+        
+        return city_stats
+    except Exception as e:
+        logger.error(f"❌ فشل في جلب توزيع المحافظات: {e}")
+        return {}
+    finally:
+        if conn:
+            conn.close()
+
+def get_monthly_revenue():
+    """الإيرادات الشهرية (افتراضية)"""
+    try:
+        total_users, premium_users = get_user_counts()
+        monthly_revenue = premium_users * 1  # 1$ لكل مشترك
+        return monthly_revenue
+    except Exception as e:
+        logger.error(f"❌ فشل في حساب الإيرادات: {e}")
+        return 0
 
 def check_expiry_and_update():
     """فحص وإنهاء الاشتراكات المنتهية"""
@@ -376,11 +434,11 @@ def get_user_city(user_id):
 def get_city_ar_from_url(url):
     """الحصول على اسم المدينة بالعربية من الـ URL"""
     if not url:
-        return "مدينتك المختارة"
+        return "غير محدد"
     for ar_name, en_name in SYRIAN_CITIES.items():
         if en_name in url:
             return ar_name
-    return "مدينتك المختارة"
+    return "غير محدد"
 
 def get_city_en_from_url(url):
     """الحصول على اسم المدينة بالإنجليزية من الـ URL"""
@@ -462,7 +520,7 @@ async def city_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
                 f"<b>مميزات الاشتراك:</b>\n"
                 f"🕋 مواقيت صلاة دقيقة لإشعاراتك\n"
                 f"☀️ تقارير الطقس اليومية\n"
-                f"📿 أذكار الصباح والمساء\n"
+                f"📿 أذكار الصباح والمساء والمتنوعة\n"
                 f"🎰 سحب أسبوعي على 1000$\n\n"
                 f"<b>💰 قيمة الاشتراك:</b> 1$ (أسبوع كامل)\n"
                 f"<b>💳 طريقة الدفع:</b> شام كاش\n\n"
@@ -489,62 +547,20 @@ async def process_payment_request(update: Update, context: ContextTypes.DEFAULT_
     if update_user_order(user_id, new_order_id):
         city_ar = get_city_ar_from_url(city_url)
         user = query.from_user
-        username_info = f"@{user.username} ({user.full_name})" if user.username else user.full_name
         
-        # 🔴 الجديد: طلب معلومات الاتصال
-        contact_message = (
-            f"📞 <b>خطوة أخيرة قبل الدفع!</b>\n\n"
-            f"للتأكد من التواصل معك بعد الدفع، يرجى إرسال:\n"
-            f"1. <b>رقم هاتفك</b> للتواصل (واتساب/تلغرام)\n"
-            f"2. <b>عنوانك</b> (إن أردت توصيل أي جوائز)\n\n"
-            f"<i>أرسل المعلومات الآن في رسالة واحدة:</i>"
-        )
+        # جلب معلومات المستخدم تلقائياً
+        username = f"@{user.username}" if user.username else "لا يوجد معرف"
+        full_name = user.full_name or "غير معروف"
         
-        # حفظ حالة انتظار معلومات الاتصال
-        context.user_data[f'waiting_contact_{user_id}'] = True
-        context.user_data[f'order_id_{user_id}'] = new_order_id
-        
-        await query.edit_message_text(contact_message, parse_mode='HTML')
-        
-    else:
-        await query.edit_message_text("❌ حدث خطأ في إنشاء رقم الطلب. يرجى المحاولة مرة أخرى.", parse_mode='HTML')
-
-async def handle_contact_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالجة معلومات الاتصال من المستخدم"""
-    user_id = update.effective_user.id
-    
-    # التحقق من أن المستخدم في مرحلة إدخال معلومات الاتصال
-    if not context.user_data.get(f'waiting_contact_{user_id}'):
-        return
-    
-    contact_info = update.message.text
-    order_id = context.user_data.get(f'order_id_{user_id}')
-    
-    if not order_id:
-        await update.message.reply_text("❌ حدث خطأ. يرجى البدء من جديد عبر /start.")
-        return
-    
-    # حفظ معلومات الاتصال
-    if save_user_contact(user_id, contact_info):
-        # تنظيف حالة المستخدم
-        del context.user_data[f'waiting_contact_{user_id}']
-        del context.user_data[f'order_id_{user_id}']
-        
-        # الحصول على معلومات المدينة
-        city_url = get_user_city(user_id)
-        city_ar = get_city_ar_from_url(city_url) if city_url else "مدينة غير محددة"
-        
-        # 🔴 الجديد: إرسال إشعار للمالك مع معلومات الاتصال
-        user = update.effective_user
-        username_info = f"@{user.username} ({user.full_name})" if user.username else user.full_name
-        
+        # 🔴 إرسال إشعار للمالك مع المعلومات التلقائية
         owner_notification = (
-            f"🔔 <b>طلب دفع جديد!</b>\n"
-            f"🧑‍💻 <b>المستخدم:</b> {username_info} (ID: <code>{user_id}</code>)\n"
-            f"📝 <b>رقم الطلب:</b> <code>{order_id}</code>\n"
+            f"🔔 <b>طلب دفع جديد!</b>\n\n"
+            f"👤 <b>الاسم:</b> {full_name}\n"
+            f"📱 <b>المعرف:</b> {username}\n"
+            f"🆔 <b>ID:</b> <code>{user_id}</code>\n"
             f"🗺️ <b>المحافظة:</b> {city_ar}\n"
-            f"📞 <b>معلومات الاتصال:</b>\n{contact_info}\n"
-            f"🔗 <b>رابط التأكيد:</b> <code>/as {order_id}</code>"
+            f"📝 <b>رقم الطلب:</b> <code>{new_order_id}</code>\n\n"
+            f"💰 <b>التفعيل:</b> <code>/as {new_order_id}</code>"
         )
         
         try:
@@ -552,21 +568,21 @@ async def handle_contact_info(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception as e:
             logger.error(f"❌ فشل إرسال إشعار للمالك: {e}")
         
-        # إرسال التعليمات للمستخدم
+        # إرسال التعليمات للمستخدم (بدون طلب معلومات اتصال)
         final_message = (
-            f"✅ <b>تم حفظ معلومات الاتصال بنجاح!</b>\n\n"
-            f"<b>طلب الخدمة رقم: {order_id}</b>\n\n"
+            f"✅ <b>تم إنشاء طلبك بنجاح!</b>\n\n"
+            f"<b>طلب الخدمة رقم: {new_order_id}</b>\n\n"
             f"<b>💰 قيمة الاشتراك:</b> 1$\n"
             f"<b>💳 طريقة الدفع:</b> شام كاش\n\n"
             f"<b>كود الدفع:</b>\n<code>{PAYMENT_QR_CODE_CONTENT}</code>\n\n"
             f"<b>خطوات الإكمال:</b>\n"
             f"1. قم بالدفع عبر رمز QR أدناه أو نسخ الكود\n"
-            f"2. أرسل إيصال الدفع للمالك\n"
-            f"3. سيتم التفعلية فوراً\n\n"
-            f"<i>تم إرسال معلومات الاتصال للمالك للتواصل معك.</i>"
+            f"2. بعد الدفع، سيتم تفعيل اشتراكك تلقائياً\n"
+            f"3. ستصل لك الإشعارات فوراً\n\n"
+            f"<i>تم إرسال طلبك للمالك. سيتم التفعلية بعد الدفع مباشرة.</i>"
         )
         
-        await update.message.reply_text(final_message, parse_mode='HTML')
+        await query.edit_message_text(final_message, parse_mode='HTML')
         
         # إرسال صورة QR Code
         if QR_CODE_IMAGE_FILE_ID:
@@ -578,13 +594,14 @@ async def handle_contact_info(update: Update, context: ContextTypes.DEFAULT_TYPE
                 )
             except Exception as e:
                 logger.error(f"❌ فشل إرسال صورة QR: {e}")
-                await update.message.reply_text(
-                    f"⚠️ <b>تعذر إرسال صورة QR:</b>\n"
-                    f"يرجى استخدام كود الدفع أعلاه مباشرة: <code>{PAYMENT_QR_CODE_CONTENT}</code>",
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=f"⚠️ <b>تعذر إرسال صورة QR:</b>\n"
+                         f"يرجى استخدام كود الدفع أعلاه مباشرة: <code>{PAYMENT_QR_CODE_CONTENT}</code>",
                     parse_mode='HTML'
                 )
     else:
-        await update.message.reply_text("❌ فشل في حفظ معلومات الاتصال. يرجى المحاولة مرة أخرى.")
+        await query.edit_message_text("❌ حدث خطأ في إنشاء رقم الطلب. يرجى المحاولة مرة أخرى.", parse_mode='HTML')
 
 async def confirm_payment_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != int(OWNER_ID_STR):
@@ -599,12 +616,8 @@ async def confirm_payment_command(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text(f"❌ لم يتم العثور على طلب: {order_id}", parse_mode='HTML')
         return
     
-    # 🔴 الجديد: الحصول على معلومات الاتصال قبل التفعيل
-    contact_info = get_user_contact(user_id)
-    
     if activate_premium(user_id, order_id):
         try:
-            # إرسال رسالة تأكيد للمستخدم
             await context.bot.send_message(
                 chat_id=user_id,
                 text=f"✅ <b>تم تفعيل اشتراكك بنجاح!</b>\n\nطلب رقم: {order_id}\nستصلك الإشعارات تلقائياً.",
@@ -613,31 +626,129 @@ async def confirm_payment_command(update: Update, context: ContextTypes.DEFAULT_
         except Exception as e:
             logger.error(f"❌ فشل إرسال رسالة للمستخدم {user_id}: {e}")
         
-        # 🔴 الجديد: إرسال إشعار للمالك مع معلومات الاتصال
-        confirmation_to_owner = (
-            f"✅ <b>تم تفعيل الاشتراك بنجاح</b>\n"
-            f"👤 <b>المستخدم:</b> {user_id}\n"
-            f"📝 <b>رقم الطلب:</b> {order_id}\n"
-        )
-        
-        if contact_info:
-            confirmation_to_owner += f"📞 <b>معلومات الاتصال:</b>\n{contact_info}\n"
-        
-        await update.message.reply_text(confirmation_to_owner, parse_mode='HTML')
+        await update.message.reply_text(f"✅ تم تفعيل الاشتراك للمستخدم {user_id}", parse_mode='HTML')
     else:
         await update.message.reply_text(f"❌ فشل في تفعيل الاشتراك.", parse_mode='HTML')
 
+# ==================== أوامر الإحصائيات المتقدمة ====================
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """الإحصائيات الأساسية"""
     if update.effective_user.id != int(OWNER_ID_STR):
         await update.message.reply_text("❌ هذا الأمر للمالك فقط.", parse_mode='HTML')
         return
     total_users, premium_users = get_user_counts()
+    today_users, today_premium = get_daily_stats()
+    monthly_revenue = get_monthly_revenue()
+    
     report = (
-        f"📊 <b>إحصائيات المشتركين</b>\n\n"
+        f"📊 <b>الإحصائيات الأساسية</b>\n\n"
         f"👤 <b>إجمالي المستخدمين:</b> {total_users}\n"
         f"⭐️ <b>المشتركين المميزين:</b> {premium_users}\n"
-        f"📅 <b>التاريخ:</b> {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        f"📈 <b>المسجلين اليوم:</b> {today_users}\n"
+        f"💰 <b>المميزين اليوم:</b> {today_premium}\n"
+        f"💵 <b>الإيرادات الشهرية (تقديرية):</b> {monthly_revenue}$\n\n"
+        f"<i>استخدم /stats_detailed لمزيد من التفاصيل</i>"
     )
+    await update.message.reply_text(report, parse_mode='HTML')
+
+async def stats_detailed_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إحصائيات مفصلة"""
+    if update.effective_user.id != int(OWNER_ID_STR):
+        await update.message.reply_text("❌ هذا الأمر للمالك فقط.", parse_mode='HTML')
+        return
+    
+    total_users, premium_users = get_user_counts()
+    today_users, today_premium = get_daily_stats()
+    monthly_revenue = get_monthly_revenue()
+    city_stats = get_city_distribution()
+    
+    # حساب النسب
+    premium_rate = (premium_users / total_users * 100) if total_users > 0 else 0
+    
+    report = (
+        f"📈 <b>الإحصائيات المفصلة</b>\n\n"
+        f"<b>👥 المستخدمين:</b>\n"
+        f"• الإجمالي: {total_users}\n"
+        f"• المميزين: {premium_users}\n"
+        f"• نسبة التميز: {premium_rate:.1f}%\n\n"
+        
+        f"<b>📊 اليوم:</b>\n"
+        f"• المسجلين: {today_users}\n"
+        f"• المميزين: {today_premium}\n\n"
+        
+        f"<b>💰 المالية:</b>\n"
+        f"• الإيرادات الشهرية: {monthly_revenue}$\n"
+        f"• متوسط الإيراد/يوم: {(monthly_revenue/30):.2f}$\n\n"
+    )
+    
+    # توزيع المحافظات
+    if city_stats:
+        report += f"<b>🗺️ توزيع المحافظات (أعلى 5):</b>\n"
+        sorted_cities = sorted(city_stats.items(), key=lambda x: x[1], reverse=True)[:5]
+        for city, count in sorted_cities:
+            percentage = (count / total_users * 100) if total_users > 0 else 0
+            report += f"• {city}: {count} ({percentage:.1f}%)\n"
+    
+    report += f"\n📅 <b>آخر تحديث:</b> {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+    
+    await update.message.reply_text(report, parse_mode='HTML')
+
+async def stats_finance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إحصائيات مالية"""
+    if update.effective_user.id != int(OWNER_ID_STR):
+        await update.message.reply_text("❌ هذا الأمر للمالك فقط.", parse_mode='HTML')
+        return
+    
+    total_users, premium_users = get_user_counts()
+    monthly_revenue = get_monthly_revenue()
+    daily_revenue = monthly_revenue / 30
+    
+    report = (
+        f"💰 <b>الإحصائيات المالية</b>\n\n"
+        f"<b>الإيرادات:</b>\n"
+        f"• الشهرية: {monthly_revenue}$\n"
+        f"• اليومية: {daily_revenue:.2f}$\n"
+        f"• الأسبوعية: {(daily_revenue * 7):.2f}$\n\n"
+        
+        f"<b>المشتركين:</b>\n"
+        f"• إجمالي المميزين: {premium_users}\n"
+        f"• قيمة كل مشترك: 1$\n"
+        f"• الإجمالي المحتمل: {total_users}$\n\n"
+        
+        f"<b>التوقعات:</b>\n"
+        f"• بعد شهر: {monthly_revenue * 2}$\n"
+        f"• بعد 3 أشهر: {monthly_revenue * 4}$\n"
+        f"• بعد سنة: {monthly_revenue * 12}$\n\n"
+        
+        f"<i>* التوقعات بناءً على النمو الحالي</i>"
+    )
+    
+    await update.message.reply_text(report, parse_mode='HTML')
+
+async def stats_geo_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إحصائيات جغرافية"""
+    if update.effective_user.id != int(OWNER_ID_STR):
+        await update.message.reply_text("❌ هذا الأمر للمالك فقط.", parse_mode='HTML')
+        return
+    
+    city_stats = get_city_distribution()
+    total_users, _ = get_user_counts()
+    
+    if not city_stats:
+        await update.message.reply_text("📭 لا توجد بيانات جغرافية متاحة بعد.", parse_mode='HTML')
+        return
+    
+    report = f"🗺️ <b>التوزيع الجغرافي للمستخدمين</b>\n\n"
+    
+    sorted_cities = sorted(city_stats.items(), key=lambda x: x[1], reverse=True)
+    
+    for city, count in sorted_cities:
+        percentage = (count / total_users * 100) if total_users > 0 else 0
+        bar = "▰" * int(percentage / 5) + "▱" * (20 - int(percentage / 5))
+        report += f"<b>{city}:</b> {count} مستخدم\n{bar} {percentage:.1f}%\n\n"
+    
+    report += f"<b>الإجمالي:</b> {total_users} مستخدم"
+    
     await update.message.reply_text(report, parse_mode='HTML')
 
 async def weather_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -657,18 +768,48 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     report_lines = []
     report_lines.append("🏥 <b>تقرير صحة البوت</b>")
     report_lines.append("=" * 40)
-    total_users, premium_users = get_user_counts()
-    report_lines.append(f"🗄️ <b>قاعدة البيانات:</b> ✅ تعمل")
-    report_lines.append(f"  • المستخدمين: {total_users}")
-    report_lines.append(f"  • المميزين: {premium_users}")
     
-    # فحص الاتصال بقاعدة البيانات
+    # فحص قاعدة البيانات
     try:
-        get_db_connection()
-        report_lines.append(f"🔌 <b>اتصال قاعدة البيانات:</b> ✅ نشط")
+        conn = get_db_connection()
+        if DATABASE_URL:
+            report_lines.append("🗄️ <b>قاعدة البيانات:</b> ✅ PostgreSQL نشط")
+        else:
+            report_lines.append("🗄️ <b>قاعدة البيانات:</b> ✅ SQLite نشط")
+        conn.close()
     except Exception as e:
-        report_lines.append(f"🔌 <b>اتصال قاعدة البيانات:</b> ❌ فشل")
+        report_lines.append(f"🗄️ <b>قاعدة البيانات:</b> ❌ خطأ: {str(e)[:50]}")
     
+    # فحص API الأذان
+    try:
+        test_url = BASE_PRAYER_API.format(city_en="Damascus")
+        response = requests.get(test_url, timeout=5)
+        if response.status_code == 200:
+            report_lines.append("🕌 <b>API الأذان:</b> ✅ يعمل")
+        else:
+            report_lines.append(f"🕌 <b>API الأذان:</b> ⚠️ مشكلة (كود {response.status_code})")
+    except:
+        report_lines.append("🕌 <b>API الأذان:</b> ❌ غير متصل")
+    
+    # فحص API الطقس
+    try:
+        test_url = BASE_WEATHER_API.format(city_en="Damascus")
+        response = requests.get(test_url, timeout=5)
+        if response.status_code == 200:
+            report_lines.append("🌤️ <b>API الطقس:</b> ✅ يعمل")
+        else:
+            report_lines.append(f"🌤️ <b>API الطقس:</b> ⚠️ مشكلة (كود {response.status_code})")
+    except:
+        report_lines.append("🌤️ <b>API الطقس:</b> ❌ غير متصل")
+    
+    # الإحصائيات
+    total_users, premium_users = get_user_counts()
+    report_lines.append(f"📊 <b>المستخدمين:</b> {total_users} ({premium_users} مميز)")
+    
+    # Scheduler
+    report_lines.append("⏰ <b>المجدول:</b> ✅ نشط")
+    
+    # الوقت
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     report_lines.append(f"🕐 <b>الوقت الحالي:</b> {now}")
     
@@ -688,6 +829,55 @@ async def get_file_id_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     await update.message.reply_text(f"✅ <b>File ID:</b>\n<code>{photo_file_id}</code>", parse_mode='HTML')
 
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """قائمة أوامر المالك"""
+    if update.effective_user.id != int(OWNER_ID_STR):
+        await update.message.reply_text("❌ هذا الأمر للمالك فقط.", parse_mode='HTML')
+        return
+    
+    keyboard = [
+        [InlineKeyboardButton("📊 الإحصائيات الأساسية", callback_data="admin_stats")],
+        [InlineKeyboardButton("📈 إحصائيات مفصلة", callback_data="admin_stats_detailed")],
+        [InlineKeyboardButton("💰 إحصائيات مالية", callback_data="admin_stats_finance")],
+        [InlineKeyboardButton("🗺️ إحصائيات جغرافية", callback_data="admin_stats_geo")],
+        [InlineKeyboardButton("🏥 فحص صحة البوت", callback_data="admin_health")],
+        [InlineKeyboardButton("🆔 الحصول على File ID", callback_data="admin_getfileid")],
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "👑 <b>لوحة تحكم المالك</b>\n\n"
+        "اختر الأمر المناسب من الأزرار أدناه:",
+        reply_markup=reply_markup,
+        parse_mode='HTML'
+    )
+
+async def admin_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالجة أزرار لوحة التحكم"""
+    query = update.callback_query
+    await query.answer()
+    
+    if query.data == "admin_stats":
+        await stats_command(update, context)
+    elif query.data == "admin_stats_detailed":
+        await stats_detailed_command(update, context)
+    elif query.data == "admin_stats_finance":
+        await stats_finance_command(update, context)
+    elif query.data == "admin_stats_geo":
+        await stats_geo_command(update, context)
+    elif query.data == "admin_health":
+        await health_command(update, context)
+    elif query.data == "admin_getfileid":
+        await query.edit_message_text(
+            "🆔 <b>الحصول على File ID</b>\n\n"
+            "لحصول على File ID للصورة:\n"
+            "1. أرسل الصورة للبوت\n"
+            "2. رد على الصورة بالأمر: <code>/getfileid</code>\n"
+            "3. سيظهر لك File ID الذي يمكنك استخدامه.",
+            parse_mode='HTML'
+        )
+
 # ==================== دوال الجدولة ====================
 async def send_single_prayer_notification(application: Application, user_id: int, prayer_name: str, city_name_ar: str):
     try:
@@ -697,6 +887,12 @@ async def send_single_prayer_notification(application: Application, user_id: int
             parse_mode='HTML'
         )
         logger.info(f"✅ إشعار صلاة {prayer_name} للمستخدم {user_id}")
+        
+        # 🔴 إرسال أذكار بعد الصلاة (عشوائي)
+        await asyncio.sleep(5)  # انتظار 5 ثواني
+        azkar_message = random.choice(AZKAR_AFTER_PRAYER)
+        await application.bot.send_message(chat_id=user_id, text=azkar_message, parse_mode='HTML')
+        
     except Exception as e:
         logger.warning(f"⚠️ فشل إرسال إشعار صلاة للمستخدم {user_id}: {e}")
 
@@ -713,6 +909,23 @@ async def send_static_content(application: Application, content_list: list, cont
         except Exception:
             pass
 
+async def send_daily_varied_azkar(application: Application):
+    """إرسال أذكار متنوعة يومياً"""
+    users = get_premium_users()
+    if not users:
+        return
+    
+    # اختيار عشوائي من أنواع الأذكار
+    azkar_types = [AZKAR_WEEKLY, DEFAULT_SUPPLICATIONS]
+    selected_type = random.choice(azkar_types)
+    message = random.choice(selected_type)
+    
+    for user_id, _ in users:
+        try:
+            await application.bot.send_message(chat_id=user_id, text=message, parse_mode='HTML')
+        except Exception as e:
+            logger.error(f"❌ فشل إرسال أذكار متنوعة للمستخدم {user_id}: {e}")
+
 async def send_weather_reports(application: Application):
     users = get_premium_users()
     if not users:
@@ -724,6 +937,12 @@ async def send_weather_reports(application: Application):
             city_en = get_city_en_from_url(city_url)
             weather_report = get_weather_data(city_en)
             await application.bot.send_message(chat_id=user_id, text=weather_report, parse_mode='HTML')
+            
+            # 🔴 إرسال دعاء عشوائي مع الطقس
+            await asyncio.sleep(2)
+            supplication = random.choice(DEFAULT_SUPPLICATIONS)
+            await application.bot.send_message(chat_id=user_id, text=supplication, parse_mode='HTML')
+            
         except Exception as e:
             logger.error(f"❌ فشل إرسال تقرير الطقس للمستخدم {user_id}: {e}")
 
@@ -782,6 +1001,8 @@ async def schedule_daily_prayer_notifications(application: Application):
 
 async def schedule_daily_tasks(application: Application):
     scheduler = application.bot_data.get('scheduler')
+    
+    # أذكار الصباح 6:30
     scheduler.add_job(
         lambda: send_static_content(application, AZKAR_SABAH_LIST, "أذكار الصباح"),
         'cron',
@@ -790,6 +1011,8 @@ async def schedule_daily_tasks(application: Application):
         timezone='Asia/Damascus',
         id='azkar_sabah_daily'
     )
+    
+    # الطقس + دعاء 8:00
     scheduler.add_job(
         send_weather_reports,
         'cron',
@@ -799,6 +1022,8 @@ async def schedule_daily_tasks(application: Application):
         timezone='Asia/Damascus',
         id='weather_reports_daily'
     )
+    
+    # أذكار الظهر 13:00
     scheduler.add_job(
         lambda: send_static_content(application, AZKAR_DHUHR_LIST, "أذكار الظهر"),
         'cron',
@@ -807,12 +1032,27 @@ async def schedule_daily_tasks(application: Application):
         timezone='Asia/Damascus',
         id='azkar_dhuhr_daily'
     )
+    
+    # أذكار متنوعة 15:00
+    scheduler.add_job(
+        send_daily_varied_azkar,
+        'cron',
+        hour=15,
+        minute=0,
+        args=[application],
+        timezone='Asia/Damascus',
+        id='varied_azkar_daily'
+    )
+    
+    # أذكار المساء (بعد صلاة العشاء - محسوبة تلقائياً)
     logger.info("✅ تم جدولة المهام اليومية")
 
 async def post_init_callback(application: Application):
     logger.info("🚀 بدء تهيئة البوت")
     scheduler = AsyncIOScheduler(timezone='Asia/Damascus')
     application.bot_data['scheduler'] = scheduler
+    
+    # فحص الاشتراكات المنتهية 00:05
     scheduler.add_job(
         check_expiry_and_update,
         'cron',
@@ -821,6 +1061,8 @@ async def post_init_callback(application: Application):
         timezone='Asia/Damascus',
         id='check_expiry_daily'
     )
+    
+    # جدولة الصلوات 01:00
     scheduler.add_job(
         schedule_daily_prayer_notifications,
         'cron',
@@ -830,6 +1072,8 @@ async def post_init_callback(application: Application):
         timezone='Asia/Damascus',
         id='schedule_prayers_daily'
     )
+    
+    # جدولة المهام اليومية فوراً
     scheduler.add_job(
         schedule_daily_tasks,
         'date',
@@ -837,6 +1081,7 @@ async def post_init_callback(application: Application):
         args=[application],
         id='schedule_tasks_initial'
     )
+    
     scheduler.start()
     application.bot_data['scheduler_started'] = True
     logger.info("✅ تم بدء تشغيل Scheduler")
@@ -869,14 +1114,16 @@ def main():
     # إضافة معالجات الأوامر
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("stats_detailed", stats_detailed_command))
+    application.add_handler(CommandHandler("stats_finance", stats_finance_command))
+    application.add_handler(CommandHandler("stats_geo", stats_geo_command))
     application.add_handler(CommandHandler("health", health_command))
     application.add_handler(CommandHandler("weather", weather_command))
+    application.add_handler(CommandHandler("admin", admin_command))
     application.add_handler(CommandHandler("as", confirm_payment_command))
     application.add_handler(CommandHandler("getfileid", get_file_id_command))
     application.add_handler(CallbackQueryHandler(city_callback_handler))
-    
-    # 🔴 الجديد: إضافة معالج لمعلومات الاتصال
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_contact_info))
+    application.add_handler(CallbackQueryHandler(admin_callback_handler, pattern="^admin_"))
     
     # تشغيل البوت
     logger.info(f"🚀 بدء البوت على المنفذ {PORT}...")
