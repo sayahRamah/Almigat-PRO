@@ -1,6 +1,5 @@
-
-python-telegram-bot==20.7
+python-telegram-bot[ext]==20.6
 apscheduler==3.10.4
 requests==2.31.0
-pg8000==1.30.4
+psycopg2-binary==2.9.9
 python-dotenv==1.0.0
