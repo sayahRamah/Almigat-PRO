@@ -5,12 +5,12 @@ import logging
 import random
 import time
 import sys
-import json
 import sqlite3
 from urllib.parse import urlparse
+from enum import Enum
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -61,51 +61,67 @@ AZKAR_MASAA_LIST = [
     "📌 <b>أذكار المساء:</b>\n\nأعوذ بكلمات الله التامات من شر ما خلق. (ثلاث مرات)"
 ]
 
-# ==================== دوال قاعدة البيانات (pg8000) ====================
+# ==================== دوال قاعدة البيانات (psycopg2) ====================
 def get_db_connection():
     """إنشاء اتصال بقاعدة البيانات"""
     try:
         if DATABASE_URL:
-            import pg8000.native
+            # استخدام PostgreSQL على Render
+            import psycopg2
             result = urlparse(DATABASE_URL)
-            conn = pg8000.native.Connection(
+            
+            # تأكد من وجود المنفذ
+            port = result.port
+            if port is None:
+                port = 5432  # المنفذ الافتراضي لـ PostgreSQL
+            
+            conn = psycopg2.connect(
+                database=result.path[1:],
                 user=result.username,
                 password=result.password,
                 host=result.hostname,
-                port=result.port,
-                database=result.path[1:]
+                port=port
             )
-            logger.info("✅ تم الاتصال بـ PostgreSQL باستخدام pg8000")
+            logger.info("✅ تم الاتصال بـ PostgreSQL باستخدام psycopg2")
             return conn
         else:
+            # استخدام SQLite للتطوير المحلي
             conn = sqlite3.connect("subscribers.db")
-            logger.info("✅ تم الاتصال بـ SQLite")
+            logger.info("✅ تم الاتصال بـ SQLite (تطوير محلي)")
             return conn
     except Exception as e:
         logger.error(f"❌ فشل الاتصال بقاعدة البيانات: {e}")
-        # استخدام SQLite كاحتياطي
-        return sqlite3.connect("subscribers.db")
+        # محاولة الاتصال بـ SQLite كحل احتياطي
+        try:
+            conn = sqlite3.connect("subscribers.db")
+            logger.info("⚠️ تم الاتصال بـ SQLite كحل احتياطي")
+            return conn
+        except:
+            raise
 
 def setup_db():
-    """إنشاء الجدول إذا لم يكن موجوداً"""
+    """إنشاء الجداول إذا لم تكن موجودة"""
     conn = None
     try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        # جدول المستخدمين
         if DATABASE_URL:
-            conn = get_db_connection()
-            # pg8000.native.Connection لا يحتاج cursor
-            conn.run("""
+            # PostgreSQL
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id BIGINT PRIMARY KEY,
                     is_premium INTEGER DEFAULT 0,
                     end_date TEXT,
                     city_url TEXT DEFAULT NULL,
                     order_id TEXT DEFAULT NULL,
+                    contact_info TEXT DEFAULT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
         else:
-            conn = sqlite3.connect("subscribers.db")
-            cursor = conn.cursor()
+            # SQLite
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
@@ -113,189 +129,249 @@ def setup_db():
                     end_date TEXT,
                     city_url TEXT DEFAULT NULL,
                     order_id TEXT DEFAULT NULL,
+                    contact_info TEXT DEFAULT NULL,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            conn.commit()
-        logger.info("✅ تم إنشاء/تحقق من جدول users")
+        
+        conn.commit()
+        logger.info("✅ تم إنشاء/تحقق من الجداول")
+        
     except Exception as e:
         logger.error(f"❌ فشل في إعداد قاعدة البيانات: {e}")
+        raise
     finally:
-        if conn and not DATABASE_URL:
+        if conn:
             conn.close()
-
-def get_premium_users():
-    """الحصول على جميع المستخدمين المميزين"""
-    try:
-        if DATABASE_URL:
-            conn = get_db_connection()
-            rows = conn.run("SELECT user_id, city_url FROM users WHERE is_premium = 1")
-            users = [(row[0], row[1]) for row in rows] if rows else []
-        else:
-            conn = sqlite3.connect("subscribers.db")
-            cursor = conn.cursor()
-            cursor.execute("SELECT user_id, city_url FROM users WHERE is_premium = 1")
-            users = cursor.fetchall()
-            conn.close()
-        return users
-    except Exception as e:
-        logger.error(f"❌ فشل في جلب المستخدمين المميزين: {e}")
-        return []
-
-def get_user_counts():
-    """الحصول على إحصائيات المستخدمين"""
-    try:
-        if DATABASE_URL:
-            conn = get_db_connection()
-            total = conn.run("SELECT COUNT(user_id) FROM users")[0][0]
-            premium = conn.run("SELECT COUNT(user_id) FROM users WHERE is_premium = 1")[0][0]
-        else:
-            conn = sqlite3.connect("subscribers.db")
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(user_id) FROM users")
-            total_users = cursor.fetchone()[0] or 0
-            cursor.execute("SELECT COUNT(user_id) FROM users WHERE is_premium = 1")
-            premium_users = cursor.fetchone()[0] or 0
-            conn.close()
-            total = total_users
-            premium = premium_users
-        return total or 0, premium or 0
-    except Exception as e:
-        logger.error(f"❌ فشل في جلب إحصائيات المستخدمين: {e}")
-        return 0, 0
 
 def save_user_city(user_id, city_url):
     """حفظ مدينة المستخدم"""
+    conn = None
     try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
         if DATABASE_URL:
-            conn = get_db_connection()
-            conn.run("""
+            cursor.execute("""
                 INSERT INTO users (user_id, city_url, is_premium) 
-                VALUES (:user_id, :city_url, 0)
+                VALUES (%s, %s, 0)
                 ON CONFLICT (user_id) 
                 DO UPDATE SET city_url = EXCLUDED.city_url
-            """, user_id=user_id, city_url=city_url)
+            """, (user_id, city_url))
         else:
-            conn = sqlite3.connect("subscribers.db")
-            cursor = conn.cursor()
             cursor.execute("""
                 INSERT OR REPLACE INTO users (user_id, city_url, is_premium) 
                 VALUES (?, ?, 0)
             """, (user_id, city_url))
-            conn.commit()
-            conn.close()
+        
+        conn.commit()
         logger.info(f"✅ تم حفظ مدينة للمستخدم {user_id}")
         return True
     except Exception as e:
         logger.error(f"❌ فشل في حفظ مدينة للمستخدم {user_id}: {e}")
         return False
+    finally:
+        if conn:
+            conn.close()
+
+def save_user_contact(user_id, contact_info):
+    """حفظ معلومات الاتصال للمستخدم"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        if DATABASE_URL:
+            cursor.execute("UPDATE users SET contact_info = %s WHERE user_id = %s", (contact_info, user_id))
+        else:
+            cursor.execute("UPDATE users SET contact_info = ? WHERE user_id = ?", (contact_info, user_id))
+        
+        conn.commit()
+        logger.info(f"✅ تم حفظ معلومات الاتصال للمستخدم {user_id}")
+        return True
+    except Exception as e:
+        logger.error(f"❌ فشل في حفظ معلومات الاتصال للمستخدم {user_id}: {e}")
+        return False
+    finally:
+        if conn:
+            conn.close()
+
+def get_user_contact(user_id):
+    """الحصول على معلومات الاتصال للمستخدم"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
+        if DATABASE_URL:
+            cursor.execute("SELECT contact_info FROM users WHERE user_id = %s", (user_id,))
+        else:
+            cursor.execute("SELECT contact_info FROM users WHERE user_id = ?", (user_id,))
+        
+        result = cursor.fetchone()
+        return result[0] if result and result[0] else None
+    except Exception as e:
+        logger.error(f"❌ فشل في جلب معلومات الاتصال للمستخدم {user_id}: {e}")
+        return None
+    finally:
+        if conn:
+            conn.close()
 
 def update_user_order(user_id, order_id):
     """تحديث رقم طلب المستخدم"""
+    conn = None
     try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
         if DATABASE_URL:
-            conn = get_db_connection()
-            conn.run("UPDATE users SET order_id = :order_id WHERE user_id = :user_id", 
-                    order_id=order_id, user_id=user_id)
+            cursor.execute("UPDATE users SET order_id = %s WHERE user_id = %s", (order_id, user_id))
         else:
-            conn = sqlite3.connect("subscribers.db")
-            cursor = conn.cursor()
             cursor.execute("UPDATE users SET order_id = ? WHERE user_id = ?", (order_id, user_id))
-            conn.commit()
-            conn.close()
+        
+        conn.commit()
         return True
     except Exception as e:
         logger.error(f"❌ فشل في تحديث طلب المستخدم {user_id}: {e}")
         return False
+    finally:
+        if conn:
+            conn.close()
 
 def activate_premium(user_id, order_id):
     """تفعيل الاشتراك المميز للمستخدم"""
+    conn = None
     try:
         today_str = (datetime.date.today() + datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
         if DATABASE_URL:
-            conn = get_db_connection()
-            result = conn.run("""
-                UPDATE users SET is_premium = 1, end_date = :end_date, order_id = NULL 
-                WHERE user_id = :user_id AND order_id = :order_id
-            """, end_date=today_str, user_id=user_id, order_id=order_id)
-            # pg8000 لا يعيد عدد الصفوف المتأثرة مباشرة، نتحقق بطريقة أخرى
-            conn = get_db_connection()
-            check = conn.run("SELECT user_id FROM users WHERE user_id = :user_id AND is_premium = 1", 
-                           user_id=user_id)
-            success = bool(check)
+            cursor.execute("""
+                UPDATE users SET is_premium = 1, end_date = %s, order_id = NULL 
+                WHERE user_id = %s AND order_id = %s
+            """, (today_str, user_id, order_id))
         else:
-            conn = sqlite3.connect("subscribers.db")
-            cursor = conn.cursor()
             cursor.execute("""
                 UPDATE users SET is_premium = 1, end_date = ?, order_id = NULL 
                 WHERE user_id = ? AND order_id = ?
             """, (today_str, user_id, order_id))
-            conn.commit()
-            success = cursor.rowcount > 0
-            conn.close()
+        
+        conn.commit()
+        success = cursor.rowcount > 0
+        conn.close()
         return success
     except Exception as e:
         logger.error(f"❌ فشل في تفعيل الاشتراك للمستخدم {user_id}: {e}")
         return False
 
+def get_premium_users():
+    """الحصول على جميع المستخدمين المميزين"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id, city_url FROM users WHERE is_premium = 1")
+        users = cursor.fetchall()
+        conn.close()
+        return users
+    except Exception as e:
+        logger.error(f"❌ فشل في جلب المستخدمين المميزين: {e}")
+        return []
+    finally:
+        if conn:
+            conn.close()
+
+def get_user_counts():
+    """الحصول على إحصائيات المستخدمين"""
+    conn = None
+    try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(user_id) FROM users")
+        total_users = cursor.fetchone()[0] or 0
+        cursor.execute("SELECT COUNT(user_id) FROM users WHERE is_premium = 1")
+        premium_users = cursor.fetchone()[0] or 0
+        conn.close()
+        return total_users, premium_users
+    except Exception as e:
+        logger.error(f"❌ فشل في جلب إحصائيات المستخدمين: {e}")
+        return 0, 0
+    finally:
+        if conn:
+            conn.close()
+
 def check_expiry_and_update():
     """فحص وإنهاء الاشتراكات المنتهية"""
+    conn = None
     try:
         current_date_str = datetime.date.today().strftime("%Y-%m-%d")
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
         if DATABASE_URL:
-            conn = get_db_connection()
-            conn.run("""
+            cursor.execute("""
                 UPDATE users SET is_premium = 0 
-                WHERE end_date <= :end_date AND is_premium = 1
-            """, end_date=current_date_str)
+                WHERE end_date <= %s AND is_premium = 1
+            """, (current_date_str,))
         else:
-            conn = sqlite3.connect("subscribers.db")
-            cursor = conn.cursor()
             cursor.execute("""
                 UPDATE users SET is_premium = 0 
                 WHERE end_date <= ? AND is_premium = 1
             """, (current_date_str,))
-            conn.commit()
-            conn.close()
-        logger.info(f"✅ تم فحص الاشتراكات المنتهية بتاريخ: {current_date_str}")
+        
+        updated_rows = cursor.rowcount
+        conn.commit()
+        logger.info(f"✅ تم إنهاء اشتراك {updated_rows} مستخدمين بتاريخ: {current_date_str}")
     except Exception as e:
         logger.error(f"❌ فشل تحديث الاشتراكات المنتهية: {e}")
+    finally:
+        if conn:
+            conn.close()
 
 def get_user_by_order(order_id):
     """الحصول على المستخدم بواسطة رقم الطلب"""
+    conn = None
     try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
         if DATABASE_URL:
-            conn = get_db_connection()
-            result = conn.run("SELECT user_id FROM users WHERE order_id = :order_id", order_id=order_id)
-            return result[0][0] if result else None
+            cursor.execute("SELECT user_id FROM users WHERE order_id = %s", (order_id,))
         else:
-            conn = sqlite3.connect("subscribers.db")
-            cursor = conn.cursor()
             cursor.execute("SELECT user_id FROM users WHERE order_id = ?", (order_id,))
-            result = cursor.fetchone()
-            conn.close()
-            return result[0] if result else None
+        
+        result = cursor.fetchone()
+        conn.close()
+        return result[0] if result else None
     except Exception as e:
         logger.error(f"❌ فشل في جلب المستخدم بواسطة الطلب {order_id}: {e}")
         return None
+    finally:
+        if conn:
+            conn.close()
 
 def get_user_city(user_id):
     """الحصول على مدينة المستخدم"""
+    conn = None
     try:
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        
         if DATABASE_URL:
-            conn = get_db_connection()
-            result = conn.run("SELECT city_url FROM users WHERE user_id = :user_id", user_id=user_id)
-            return result[0][0] if result else None
+            cursor.execute("SELECT city_url FROM users WHERE user_id = %s", (user_id,))
         else:
-            conn = sqlite3.connect("subscribers.db")
-            cursor = conn.cursor()
             cursor.execute("SELECT city_url FROM users WHERE user_id = ?", (user_id,))
-            result = cursor.fetchone()
-            conn.close()
-            return result[0] if result else None
+        
+        result = cursor.fetchone()
+        conn.close()
+        return result[0] if result else None
     except Exception as e:
         logger.error(f"❌ فشل في جلب مدينة المستخدم {user_id}: {e}")
         return None
+    finally:
+        if conn:
+            conn.close()
 
 def get_city_ar_from_url(url):
     """الحصول على اسم المدينة بالعربية من الـ URL"""
@@ -415,12 +491,60 @@ async def process_payment_request(update: Update, context: ContextTypes.DEFAULT_
         user = query.from_user
         username_info = f"@{user.username} ({user.full_name})" if user.username else user.full_name
         
+        # 🔴 الجديد: طلب معلومات الاتصال
+        contact_message = (
+            f"📞 <b>خطوة أخيرة قبل الدفع!</b>\n\n"
+            f"للتأكد من التواصل معك بعد الدفع، يرجى إرسال:\n"
+            f"1. <b>رقم هاتفك</b> للتواصل (واتساب/تلغرام)\n"
+            f"2. <b>عنوانك</b> (إن أردت توصيل أي جوائز)\n\n"
+            f"<i>أرسل المعلومات الآن في رسالة واحدة:</i>"
+        )
+        
+        # حفظ حالة انتظار معلومات الاتصال
+        context.user_data[f'waiting_contact_{user_id}'] = True
+        context.user_data[f'order_id_{user_id}'] = new_order_id
+        
+        await query.edit_message_text(contact_message, parse_mode='HTML')
+        
+    else:
+        await query.edit_message_text("❌ حدث خطأ في إنشاء رقم الطلب. يرجى المحاولة مرة أخرى.", parse_mode='HTML')
+
+async def handle_contact_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالجة معلومات الاتصال من المستخدم"""
+    user_id = update.effective_user.id
+    
+    # التحقق من أن المستخدم في مرحلة إدخال معلومات الاتصال
+    if not context.user_data.get(f'waiting_contact_{user_id}'):
+        return
+    
+    contact_info = update.message.text
+    order_id = context.user_data.get(f'order_id_{user_id}')
+    
+    if not order_id:
+        await update.message.reply_text("❌ حدث خطأ. يرجى البدء من جديد عبر /start.")
+        return
+    
+    # حفظ معلومات الاتصال
+    if save_user_contact(user_id, contact_info):
+        # تنظيف حالة المستخدم
+        del context.user_data[f'waiting_contact_{user_id}']
+        del context.user_data[f'order_id_{user_id}']
+        
+        # الحصول على معلومات المدينة
+        city_url = get_user_city(user_id)
+        city_ar = get_city_ar_from_url(city_url) if city_url else "مدينة غير محددة"
+        
+        # 🔴 الجديد: إرسال إشعار للمالك مع معلومات الاتصال
+        user = update.effective_user
+        username_info = f"@{user.username} ({user.full_name})" if user.username else user.full_name
+        
         owner_notification = (
             f"🔔 <b>طلب دفع جديد!</b>\n"
-            f"🧑‍💻 <b>المستخدم:</b> {username_info}\n"
-            f"📝 <b>رقم الطلب:</b> <code>{new_order_id}</code>\n"
+            f"🧑‍💻 <b>المستخدم:</b> {username_info} (ID: <code>{user_id}</code>)\n"
+            f"📝 <b>رقم الطلب:</b> <code>{order_id}</code>\n"
             f"🗺️ <b>المحافظة:</b> {city_ar}\n"
-            f"🔗 <b>رابط التأكيد:</b> <code>/as {new_order_id}</code>"
+            f"📞 <b>معلومات الاتصال:</b>\n{contact_info}\n"
+            f"🔗 <b>رابط التأكيد:</b> <code>/as {order_id}</code>"
         )
         
         try:
@@ -428,23 +552,39 @@ async def process_payment_request(update: Update, context: ContextTypes.DEFAULT_
         except Exception as e:
             logger.error(f"❌ فشل إرسال إشعار للمالك: {e}")
         
+        # إرسال التعليمات للمستخدم
         final_message = (
-            f"✅ <b>طلب الخدمة رقم: {new_order_id}</b>\n\n"
+            f"✅ <b>تم حفظ معلومات الاتصال بنجاح!</b>\n\n"
+            f"<b>طلب الخدمة رقم: {order_id}</b>\n\n"
             f"<b>💰 قيمة الاشتراك:</b> 1$\n"
             f"<b>💳 طريقة الدفع:</b> شام كاش\n\n"
             f"<b>كود الدفع:</b>\n<code>{PAYMENT_QR_CODE_CONTENT}</code>\n\n"
-            f"1. قم بالدفع عبر رمز QR أو نسخ الكود\n"
+            f"<b>خطوات الإكمال:</b>\n"
+            f"1. قم بالدفع عبر رمز QR أدناه أو نسخ الكود\n"
             f"2. أرسل إيصال الدفع للمالك\n"
-            f"3. ستتم المفعلة فوراً"
+            f"3. سيتم التفعلية فوراً\n\n"
+            f"<i>تم إرسال معلومات الاتصال للمالك للتواصل معك.</i>"
         )
         
-        await query.edit_message_text(final_message, parse_mode='HTML')
+        await update.message.reply_text(final_message, parse_mode='HTML')
         
+        # إرسال صورة QR Code
         if QR_CODE_IMAGE_FILE_ID:
             try:
-                await context.bot.send_photo(chat_id=user_id, photo=QR_CODE_IMAGE_FILE_ID, caption="رمز QR للدفع عبر شام كاش")
+                await context.bot.send_photo(
+                    chat_id=user_id,
+                    photo=QR_CODE_IMAGE_FILE_ID,
+                    caption="رمز QR للدفع عبر شام كاش. يرجى مسحه ضوئياً لإكمال الدفع."
+                )
             except Exception as e:
                 logger.error(f"❌ فشل إرسال صورة QR: {e}")
+                await update.message.reply_text(
+                    f"⚠️ <b>تعذر إرسال صورة QR:</b>\n"
+                    f"يرجى استخدام كود الدفع أعلاه مباشرة: <code>{PAYMENT_QR_CODE_CONTENT}</code>",
+                    parse_mode='HTML'
+                )
+    else:
+        await update.message.reply_text("❌ فشل في حفظ معلومات الاتصال. يرجى المحاولة مرة أخرى.")
 
 async def confirm_payment_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != int(OWNER_ID_STR):
@@ -458,12 +598,32 @@ async def confirm_payment_command(update: Update, context: ContextTypes.DEFAULT_
     if not user_id:
         await update.message.reply_text(f"❌ لم يتم العثور على طلب: {order_id}", parse_mode='HTML')
         return
+    
+    # 🔴 الجديد: الحصول على معلومات الاتصال قبل التفعيل
+    contact_info = get_user_contact(user_id)
+    
     if activate_premium(user_id, order_id):
         try:
-            await context.bot.send_message(chat_id=user_id, text=f"✅ <b>تم تفعيل اشتراكك بنجاح!</b>\nطلب رقم: {order_id}\nستصلك الإشعارات تلقائياً.", parse_mode='HTML')
+            # إرسال رسالة تأكيد للمستخدم
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"✅ <b>تم تفعيل اشتراكك بنجاح!</b>\n\nطلب رقم: {order_id}\nستصلك الإشعارات تلقائياً.",
+                parse_mode='HTML'
+            )
         except Exception as e:
             logger.error(f"❌ فشل إرسال رسالة للمستخدم {user_id}: {e}")
-        await update.message.reply_text(f"✅ تم تفعيل الاشتراك للمستخدم {user_id}", parse_mode='HTML')
+        
+        # 🔴 الجديد: إرسال إشعار للمالك مع معلومات الاتصال
+        confirmation_to_owner = (
+            f"✅ <b>تم تفعيل الاشتراك بنجاح</b>\n"
+            f"👤 <b>المستخدم:</b> {user_id}\n"
+            f"📝 <b>رقم الطلب:</b> {order_id}\n"
+        )
+        
+        if contact_info:
+            confirmation_to_owner += f"📞 <b>معلومات الاتصال:</b>\n{contact_info}\n"
+        
+        await update.message.reply_text(confirmation_to_owner, parse_mode='HTML')
     else:
         await update.message.reply_text(f"❌ فشل في تفعيل الاشتراك.", parse_mode='HTML')
 
@@ -501,8 +661,17 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     report_lines.append(f"🗄️ <b>قاعدة البيانات:</b> ✅ تعمل")
     report_lines.append(f"  • المستخدمين: {total_users}")
     report_lines.append(f"  • المميزين: {premium_users}")
+    
+    # فحص الاتصال بقاعدة البيانات
+    try:
+        get_db_connection()
+        report_lines.append(f"🔌 <b>اتصال قاعدة البيانات:</b> ✅ نشط")
+    except Exception as e:
+        report_lines.append(f"🔌 <b>اتصال قاعدة البيانات:</b> ❌ فشل")
+    
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     report_lines.append(f"🕐 <b>الوقت الحالي:</b> {now}")
+    
     await update.message.reply_text("\n".join(report_lines), parse_mode='HTML')
 
 async def get_file_id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -522,7 +691,11 @@ async def get_file_id_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ==================== دوال الجدولة ====================
 async def send_single_prayer_notification(application: Application, user_id: int, prayer_name: str, city_name_ar: str):
     try:
-        await application.bot.send_message(chat_id=user_id, text=f"🕋 <b>الله أكبر، الله أكبر.</b> حان الآن وقت صلاة <b>{prayer_name}</b> في محافظة <b>{city_name_ar}</b>.", parse_mode='HTML')
+        await application.bot.send_message(
+            chat_id=user_id,
+            text=f"🕋 <b>الله أكبر، الله أكبر.</b> حان الآن وقت صلاة <b>{prayer_name}</b> في محافظة <b>{city_name_ar}</b>.",
+            parse_mode='HTML'
+        )
         logger.info(f"✅ إشعار صلاة {prayer_name} للمستخدم {user_id}")
     except Exception as e:
         logger.warning(f"⚠️ فشل إرسال إشعار صلاة للمستخدم {user_id}: {e}")
@@ -561,7 +734,14 @@ async def schedule_daily_prayer_notifications(application: Application):
     if not users_data:
         return
     
-    PRAYER_FIELDS = {"الفجر": 'Fajr', "الظهر": 'Dhuhr', "العصر": 'Asr', "المغرب": 'Maghrib', "العشاء": 'Isha'}
+    PRAYER_FIELDS = {
+        "الفجر": 'Fajr',
+        "الظهر": 'Dhuhr',
+        "العصر": 'Asr',
+        "المغرب": 'Maghrib',
+        "العشاء": 'Isha'
+    }
+    
     scheduler = application.bot_data.get('scheduler')
     
     for user_id, city_url in users_data:
@@ -578,10 +758,23 @@ async def schedule_daily_prayer_notifications(application: Application):
                 if time_str:
                     try:
                         hour, minute = map(int, time_str.split(':'))
-                        run_datetime = datetime.datetime(current_date.year, current_date.month, current_date.day, hour, minute, 0)
+                        run_datetime = datetime.datetime(
+                            current_date.year,
+                            current_date.month,
+                            current_date.day,
+                            hour,
+                            minute,
+                            0
+                        )
                         if run_datetime > datetime.datetime.now():
                             job_id = f"prayer_{user_id}_{prayer_key_en}_{current_date.strftime('%Y%m%d')}"
-                            scheduler.add_job(send_single_prayer_notification, 'date', run_date=run_datetime, args=[application, user_id, prayer_name_ar, city_name_ar], id=job_id)
+                            scheduler.add_job(
+                                send_single_prayer_notification,
+                                'date',
+                                run_date=run_datetime,
+                                args=[application, user_id, prayer_name_ar, city_name_ar],
+                                id=job_id
+                            )
                     except:
                         pass
         except Exception as e:
@@ -589,36 +782,91 @@ async def schedule_daily_prayer_notifications(application: Application):
 
 async def schedule_daily_tasks(application: Application):
     scheduler = application.bot_data.get('scheduler')
-    scheduler.add_job(lambda: send_static_content(application, AZKAR_SABAH_LIST, "أذكار الصباح"), 'cron', hour=6, minute=30, timezone='Asia/Damascus', id='azkar_sabah_daily')
-    scheduler.add_job(send_weather_reports, 'cron', hour=8, minute=0, args=[application], timezone='Asia/Damascus', id='weather_reports_daily')
-    scheduler.add_job(lambda: send_static_content(application, AZKAR_DHUHR_LIST, "أذكار الظهر"), 'cron', hour=13, minute=0, timezone='Asia/Damascus', id='azkar_dhuhr_daily')
+    scheduler.add_job(
+        lambda: send_static_content(application, AZKAR_SABAH_LIST, "أذكار الصباح"),
+        'cron',
+        hour=6,
+        minute=30,
+        timezone='Asia/Damascus',
+        id='azkar_sabah_daily'
+    )
+    scheduler.add_job(
+        send_weather_reports,
+        'cron',
+        hour=8,
+        minute=0,
+        args=[application],
+        timezone='Asia/Damascus',
+        id='weather_reports_daily'
+    )
+    scheduler.add_job(
+        lambda: send_static_content(application, AZKAR_DHUHR_LIST, "أذكار الظهر"),
+        'cron',
+        hour=13,
+        minute=0,
+        timezone='Asia/Damascus',
+        id='azkar_dhuhr_daily'
+    )
     logger.info("✅ تم جدولة المهام اليومية")
 
 async def post_init_callback(application: Application):
     logger.info("🚀 بدء تهيئة البوت")
     scheduler = AsyncIOScheduler(timezone='Asia/Damascus')
     application.bot_data['scheduler'] = scheduler
-    scheduler.add_job(check_expiry_and_update, 'cron', hour=0, minute=5, timezone='Asia/Damascus', id='check_expiry_daily')
-    scheduler.add_job(schedule_daily_prayer_notifications, 'cron', hour=1, minute=0, args=[application], timezone='Asia/Damascus', id='schedule_prayers_daily')
-    scheduler.add_job(schedule_daily_tasks, 'date', run_date=datetime.datetime.now() + datetime.timedelta(seconds=10), args=[application], id='schedule_tasks_initial')
+    scheduler.add_job(
+        check_expiry_and_update,
+        'cron',
+        hour=0,
+        minute=5,
+        timezone='Asia/Damascus',
+        id='check_expiry_daily'
+    )
+    scheduler.add_job(
+        schedule_daily_prayer_notifications,
+        'cron',
+        hour=1,
+        minute=0,
+        args=[application],
+        timezone='Asia/Damascus',
+        id='schedule_prayers_daily'
+    )
+    scheduler.add_job(
+        schedule_daily_tasks,
+        'date',
+        run_date=datetime.datetime.now() + datetime.timedelta(seconds=10),
+        args=[application],
+        id='schedule_tasks_initial'
+    )
     scheduler.start()
     application.bot_data['scheduler_started'] = True
     logger.info("✅ تم بدء تشغيل Scheduler")
 
 # ==================== الدالة الرئيسية ====================
 def main():
+    """الدالة الرئيسية لتشغيل البوت"""
+    # التحقق من المتغيرات المطلوبة
     if not TOKEN or not OWNER_ID_STR or not WEBHOOK_URL:
         logger.error("❌ يجب تحديد متغيرات البيئة: TOKEN, OWNER_ID, WEBHOOK_URL")
         sys.exit(1)
+    
     try:
         OWNER_ID = int(OWNER_ID_STR)
     except ValueError:
         logger.error("❌ OWNER_ID يجب أن يكون رقماً")
         sys.exit(1)
     
-    setup_db()
+    # إعداد قاعدة البيانات
+    try:
+        setup_db()
+        logger.info("✅ تم إعداد قاعدة البيانات")
+    except Exception as e:
+        logger.error(f"❌ فشل إعداد قاعدة البيانات: {e}")
+        sys.exit(1)
     
+    # إنشاء التطبيق
     application = Application.builder().token(TOKEN).post_init(post_init_callback).build()
+    
+    # إضافة معالجات الأوامر
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("health", health_command))
@@ -627,9 +875,20 @@ def main():
     application.add_handler(CommandHandler("getfileid", get_file_id_command))
     application.add_handler(CallbackQueryHandler(city_callback_handler))
     
+    # 🔴 الجديد: إضافة معالج لمعلومات الاتصال
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_contact_info))
+    
+    # تشغيل البوت
     logger.info(f"🚀 بدء البوت على المنفذ {PORT}...")
+    
     try:
-        application.run_webhook(listen="0.0.0.0", port=PORT, url_path=TOKEN, webhook_url=f"{WEBHOOK_URL}/{TOKEN}", drop_pending_updates=True)
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=TOKEN,
+            webhook_url=f"{WEBHOOK_URL}/{TOKEN}",
+            drop_pending_updates=True
+        )
     except Exception as e:
         logger.error(f"❌ فشل في تشغيل البوت: {e}")
         sys.exit(1)
