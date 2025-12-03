@@ -6,7 +6,7 @@ import random
 import time
 import sys
 import json
-import asyncio
+import sqlite3
 from urllib.parse import urlparse
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -21,7 +21,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ==================== الثوابت (تُقرأ من متغيرات البيئة) ====================
+# ==================== الثوابت ====================
 TOKEN = os.environ.get("TOKEN")
 OWNER_ID_STR = os.environ.get("OWNER_ID") 
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL") 
@@ -61,37 +61,39 @@ AZKAR_MASAA_LIST = [
     "📌 <b>أذكار المساء:</b>\n\nأعوذ بكلمات الله التامات من شر ما خلق. (ثلاث مرات)"
 ]
 
-# ==================== دوال قاعدة البيانات (asyncpg) ====================
-async def get_db_connection():
+# ==================== دوال قاعدة البيانات (pg8000) ====================
+def get_db_connection():
     """إنشاء اتصال بقاعدة البيانات"""
     try:
         if DATABASE_URL:
-            import asyncpg
+            import pg8000.native
             result = urlparse(DATABASE_URL)
-            conn = await asyncpg.connect(
+            conn = pg8000.native.Connection(
                 user=result.username,
                 password=result.password,
                 host=result.hostname,
                 port=result.port,
                 database=result.path[1:]
             )
-            logger.info("✅ تم الاتصال بـ PostgreSQL باستخدام asyncpg")
+            logger.info("✅ تم الاتصال بـ PostgreSQL باستخدام pg8000")
             return conn
         else:
-            import sqlite3
             conn = sqlite3.connect("subscribers.db")
             logger.info("✅ تم الاتصال بـ SQLite")
             return conn
     except Exception as e:
         logger.error(f"❌ فشل الاتصال بقاعدة البيانات: {e}")
-        raise
+        # استخدام SQLite كاحتياطي
+        return sqlite3.connect("subscribers.db")
 
-async def setup_db():
+def setup_db():
     """إنشاء الجدول إذا لم يكن موجوداً"""
+    conn = None
     try:
         if DATABASE_URL:
-            conn = await get_db_connection()
-            await conn.execute("""
+            conn = get_db_connection()
+            # pg8000.native.Connection لا يحتاج cursor
+            conn.run("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id BIGINT PRIMARY KEY,
                     is_premium INTEGER DEFAULT 0,
@@ -101,9 +103,7 @@ async def setup_db():
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
-            await conn.close()
         else:
-            import sqlite3
             conn = sqlite3.connect("subscribers.db")
             cursor = conn.cursor()
             cursor.execute("""
@@ -117,42 +117,39 @@ async def setup_db():
                 )
             """)
             conn.commit()
-            conn.close()
         logger.info("✅ تم إنشاء/تحقق من جدول users")
     except Exception as e:
         logger.error(f"❌ فشل في إعداد قاعدة البيانات: {e}")
+    finally:
+        if conn and not DATABASE_URL:
+            conn.close()
 
-async def get_premium_users():
+def get_premium_users():
     """الحصول على جميع المستخدمين المميزين"""
     try:
         if DATABASE_URL:
-            conn = await get_db_connection()
-            users = await conn.fetch("SELECT user_id, city_url FROM users WHERE is_premium = 1")
-            await conn.close()
-            return [(row['user_id'], row['city_url']) for row in users]
+            conn = get_db_connection()
+            rows = conn.run("SELECT user_id, city_url FROM users WHERE is_premium = 1")
+            users = [(row[0], row[1]) for row in rows] if rows else []
         else:
-            import sqlite3
             conn = sqlite3.connect("subscribers.db")
             cursor = conn.cursor()
             cursor.execute("SELECT user_id, city_url FROM users WHERE is_premium = 1")
             users = cursor.fetchall()
             conn.close()
-            return users
+        return users
     except Exception as e:
         logger.error(f"❌ فشل في جلب المستخدمين المميزين: {e}")
         return []
 
-async def get_user_counts():
+def get_user_counts():
     """الحصول على إحصائيات المستخدمين"""
     try:
         if DATABASE_URL:
-            conn = await get_db_connection()
-            total = await conn.fetchval("SELECT COUNT(user_id) FROM users")
-            premium = await conn.fetchval("SELECT COUNT(user_id) FROM users WHERE is_premium = 1")
-            await conn.close()
-            return total or 0, premium or 0
+            conn = get_db_connection()
+            total = conn.run("SELECT COUNT(user_id) FROM users")[0][0]
+            premium = conn.run("SELECT COUNT(user_id) FROM users WHERE is_premium = 1")[0][0]
         else:
-            import sqlite3
             conn = sqlite3.connect("subscribers.db")
             cursor = conn.cursor()
             cursor.execute("SELECT COUNT(user_id) FROM users")
@@ -160,25 +157,25 @@ async def get_user_counts():
             cursor.execute("SELECT COUNT(user_id) FROM users WHERE is_premium = 1")
             premium_users = cursor.fetchone()[0] or 0
             conn.close()
-            return total_users, premium_users
+            total = total_users
+            premium = premium_users
+        return total or 0, premium or 0
     except Exception as e:
         logger.error(f"❌ فشل في جلب إحصائيات المستخدمين: {e}")
         return 0, 0
 
-async def save_user_city(user_id, city_url):
+def save_user_city(user_id, city_url):
     """حفظ مدينة المستخدم"""
     try:
         if DATABASE_URL:
-            conn = await get_db_connection()
-            await conn.execute("""
+            conn = get_db_connection()
+            conn.run("""
                 INSERT INTO users (user_id, city_url, is_premium) 
-                VALUES ($1, $2, 0)
+                VALUES (:user_id, :city_url, 0)
                 ON CONFLICT (user_id) 
                 DO UPDATE SET city_url = EXCLUDED.city_url
-            """, user_id, city_url)
-            await conn.close()
+            """, user_id=user_id, city_url=city_url)
         else:
-            import sqlite3
             conn = sqlite3.connect("subscribers.db")
             cursor = conn.cursor()
             cursor.execute("""
@@ -193,15 +190,14 @@ async def save_user_city(user_id, city_url):
         logger.error(f"❌ فشل في حفظ مدينة للمستخدم {user_id}: {e}")
         return False
 
-async def update_user_order(user_id, order_id):
+def update_user_order(user_id, order_id):
     """تحديث رقم طلب المستخدم"""
     try:
         if DATABASE_URL:
-            conn = await get_db_connection()
-            await conn.execute("UPDATE users SET order_id = $1 WHERE user_id = $2", order_id, user_id)
-            await conn.close()
+            conn = get_db_connection()
+            conn.run("UPDATE users SET order_id = :order_id WHERE user_id = :user_id", 
+                    order_id=order_id, user_id=user_id)
         else:
-            import sqlite3
             conn = sqlite3.connect("subscribers.db")
             cursor = conn.cursor()
             cursor.execute("UPDATE users SET order_id = ? WHERE user_id = ?", (order_id, user_id))
@@ -212,20 +208,22 @@ async def update_user_order(user_id, order_id):
         logger.error(f"❌ فشل في تحديث طلب المستخدم {user_id}: {e}")
         return False
 
-async def activate_premium(user_id, order_id):
+def activate_premium(user_id, order_id):
     """تفعيل الاشتراك المميز للمستخدم"""
     try:
         today_str = (datetime.date.today() + datetime.timedelta(days=7)).strftime("%Y-%m-%d")
         if DATABASE_URL:
-            conn = await get_db_connection()
-            result = await conn.execute("""
-                UPDATE users SET is_premium = 1, end_date = $1, order_id = NULL 
-                WHERE user_id = $2 AND order_id = $3
-            """, today_str, user_id, order_id)
-            await conn.close()
-            return "UPDATE" in str(result)
+            conn = get_db_connection()
+            result = conn.run("""
+                UPDATE users SET is_premium = 1, end_date = :end_date, order_id = NULL 
+                WHERE user_id = :user_id AND order_id = :order_id
+            """, end_date=today_str, user_id=user_id, order_id=order_id)
+            # pg8000 لا يعيد عدد الصفوف المتأثرة مباشرة، نتحقق بطريقة أخرى
+            conn = get_db_connection()
+            check = conn.run("SELECT user_id FROM users WHERE user_id = :user_id AND is_premium = 1", 
+                           user_id=user_id)
+            success = bool(check)
         else:
-            import sqlite3
             conn = sqlite3.connect("subscribers.db")
             cursor = conn.cursor()
             cursor.execute("""
@@ -235,48 +233,42 @@ async def activate_premium(user_id, order_id):
             conn.commit()
             success = cursor.rowcount > 0
             conn.close()
-            return success
+        return success
     except Exception as e:
         logger.error(f"❌ فشل في تفعيل الاشتراك للمستخدم {user_id}: {e}")
         return False
 
-async def check_expiry_and_update():
+def check_expiry_and_update():
     """فحص وإنهاء الاشتراكات المنتهية"""
     try:
         current_date_str = datetime.date.today().strftime("%Y-%m-%d")
         if DATABASE_URL:
-            conn = await get_db_connection()
-            result = await conn.execute("""
+            conn = get_db_connection()
+            conn.run("""
                 UPDATE users SET is_premium = 0 
-                WHERE end_date <= $1 AND is_premium = 1
-            """, current_date_str)
-            await conn.close()
-            logger.info(f"✅ تم إنهاء اشتراكات منتهية: {result}")
+                WHERE end_date <= :end_date AND is_premium = 1
+            """, end_date=current_date_str)
         else:
-            import sqlite3
             conn = sqlite3.connect("subscribers.db")
             cursor = conn.cursor()
             cursor.execute("""
                 UPDATE users SET is_premium = 0 
                 WHERE end_date <= ? AND is_premium = 1
             """, (current_date_str,))
-            updated_rows = cursor.rowcount
             conn.commit()
             conn.close()
-            logger.info(f"✅ تم إنهاء اشتراك {updated_rows} مستخدمين بتاريخ: {current_date_str}")
+        logger.info(f"✅ تم فحص الاشتراكات المنتهية بتاريخ: {current_date_str}")
     except Exception as e:
         logger.error(f"❌ فشل تحديث الاشتراكات المنتهية: {e}")
 
-async def get_user_by_order(order_id):
+def get_user_by_order(order_id):
     """الحصول على المستخدم بواسطة رقم الطلب"""
     try:
         if DATABASE_URL:
-            conn = await get_db_connection()
-            result = await conn.fetchval("SELECT user_id FROM users WHERE order_id = $1", order_id)
-            await conn.close()
-            return result
+            conn = get_db_connection()
+            result = conn.run("SELECT user_id FROM users WHERE order_id = :order_id", order_id=order_id)
+            return result[0][0] if result else None
         else:
-            import sqlite3
             conn = sqlite3.connect("subscribers.db")
             cursor = conn.cursor()
             cursor.execute("SELECT user_id FROM users WHERE order_id = ?", (order_id,))
@@ -287,16 +279,14 @@ async def get_user_by_order(order_id):
         logger.error(f"❌ فشل في جلب المستخدم بواسطة الطلب {order_id}: {e}")
         return None
 
-async def get_user_city(user_id):
+def get_user_city(user_id):
     """الحصول على مدينة المستخدم"""
     try:
         if DATABASE_URL:
-            conn = await get_db_connection()
-            result = await conn.fetchval("SELECT city_url FROM users WHERE user_id = $1", user_id)
-            await conn.close()
-            return result
+            conn = get_db_connection()
+            result = conn.run("SELECT city_url FROM users WHERE user_id = :user_id", user_id=user_id)
+            return result[0][0] if result else None
         else:
-            import sqlite3
             conn = sqlite3.connect("subscribers.db")
             cursor = conn.cursor()
             cursor.execute("SELECT city_url FROM users WHERE user_id = ?", (user_id,))
@@ -337,7 +327,6 @@ def get_weather_data(city_en):
         response.raise_for_status()
         weather_data = response.text.strip()
         
-        # تحويل البيانات إلى تنسيق جميل
         parts = weather_data.split()
         if len(parts) >= 4:
             condition = parts[0]
@@ -388,7 +377,7 @@ async def city_callback_handler(update: Update, context: ContextTypes.DEFAULT_TY
         final_prayer_url = BASE_PRAYER_API.format(city_en=city_en)
         city_ar = get_city_ar_from_url(final_prayer_url)
         
-        if await save_user_city(user_id, final_prayer_url):
+        if save_user_city(user_id, final_prayer_url):
             subscribe_keyboard = InlineKeyboardMarkup([[
                 InlineKeyboardButton("💰 تفعيل الاشتراك الآن", callback_data="ACTIVATE_ORDER")
             ]])
@@ -414,14 +403,14 @@ async def process_payment_request(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
     user_id = query.from_user.id
     
-    city_url = await get_user_city(user_id)
+    city_url = get_user_city(user_id)
     if not city_url:
         await query.edit_message_text("❌ لم يتم اختيار المحافظة بعد. يرجى البدء من جديد عبر /start.", parse_mode='HTML')
         return
     
     new_order_id = generate_order_id(user_id)
     
-    if await update_user_order(user_id, new_order_id):
+    if update_user_order(user_id, new_order_id):
         city_ar = get_city_ar_from_url(city_url)
         user = query.from_user
         username_info = f"@{user.username} ({user.full_name})" if user.username else user.full_name
@@ -465,11 +454,11 @@ async def confirm_payment_command(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text("⚠️ يرجى تحديد رقم الطلب: <code>/as &lt;رقم_الطلب&gt;</code>", parse_mode='HTML')
         return
     order_id = context.args[0]
-    user_id = await get_user_by_order(order_id)
+    user_id = get_user_by_order(order_id)
     if not user_id:
         await update.message.reply_text(f"❌ لم يتم العثور على طلب: {order_id}", parse_mode='HTML')
         return
-    if await activate_premium(user_id, order_id):
+    if activate_premium(user_id, order_id):
         try:
             await context.bot.send_message(chat_id=user_id, text=f"✅ <b>تم تفعيل اشتراكك بنجاح!</b>\nطلب رقم: {order_id}\nستصلك الإشعارات تلقائياً.", parse_mode='HTML')
         except Exception as e:
@@ -482,7 +471,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != int(OWNER_ID_STR):
         await update.message.reply_text("❌ هذا الأمر للمالك فقط.", parse_mode='HTML')
         return
-    total_users, premium_users = await get_user_counts()
+    total_users, premium_users = get_user_counts()
     report = (
         f"📊 <b>إحصائيات المشتركين</b>\n\n"
         f"👤 <b>إجمالي المستخدمين:</b> {total_users}\n"
@@ -493,7 +482,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def weather_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    city_url = await get_user_city(user_id)
+    city_url = get_user_city(user_id)
     if not city_url:
         await update.message.reply_text("❌ يرجى اختيار المحافظة أولاً عبر /start")
         return
@@ -508,7 +497,7 @@ async def health_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     report_lines = []
     report_lines.append("🏥 <b>تقرير صحة البوت</b>")
     report_lines.append("=" * 40)
-    total_users, premium_users = await get_user_counts()
+    total_users, premium_users = get_user_counts()
     report_lines.append(f"🗄️ <b>قاعدة البيانات:</b> ✅ تعمل")
     report_lines.append(f"  • المستخدمين: {total_users}")
     report_lines.append(f"  • المميزين: {premium_users}")
@@ -541,19 +530,18 @@ async def send_single_prayer_notification(application: Application, user_id: int
 async def send_static_content(application: Application, content_list: list, content_type: str):
     if not content_list:
         return
-    users = await get_premium_users()
+    users = get_premium_users()
     if not users:
         return
     message = random.choice(content_list)
     for user_id, _ in users:
         try:
             await application.bot.send_message(chat_id=user_id, text=message, parse_mode='HTML')
-            await asyncio.sleep(0.5)
         except Exception:
             pass
 
 async def send_weather_reports(application: Application):
-    users = await get_premium_users()
+    users = get_premium_users()
     if not users:
         return
     for user_id, city_url in users:
@@ -563,14 +551,13 @@ async def send_weather_reports(application: Application):
             city_en = get_city_en_from_url(city_url)
             weather_report = get_weather_data(city_en)
             await application.bot.send_message(chat_id=user_id, text=weather_report, parse_mode='HTML')
-            await asyncio.sleep(1)
         except Exception as e:
             logger.error(f"❌ فشل إرسال تقرير الطقس للمستخدم {user_id}: {e}")
 
 async def schedule_daily_prayer_notifications(application: Application):
     logger.info("🔄 جدولة إشعارات الصلاة اليومية")
     current_date = datetime.datetime.now().date()
-    users_data = await get_premium_users()
+    users_data = get_premium_users()
     if not users_data:
         return
     
@@ -629,9 +616,7 @@ def main():
         logger.error("❌ OWNER_ID يجب أن يكون رقماً")
         sys.exit(1)
     
-    # تشغيل إعداد قاعدة البيانات بشكل متزامن
-    import asyncio
-    asyncio.run(setup_db())
+    setup_db()
     
     application = Application.builder().token(TOKEN).post_init(post_init_callback).build()
     application.add_handler(CommandHandler("start", start_command))
